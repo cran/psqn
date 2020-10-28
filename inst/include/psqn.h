@@ -377,7 +377,7 @@ public:
     thread_mem = (thread_mem + mult - 1L) / mult;
     thread_mem *= mult;
 
-    std::array<size_t, 3L> ret = { out, 3L * n_par, thread_mem };
+    std::array<size_t, 3L> ret = { out, 5L * n_par, thread_mem };
     return ret;
   })()),
   max_threads(max_threads > 0 ? max_threads : 1L),
@@ -503,7 +503,7 @@ public:
       for(size_t i = 0; i < n_funcs; ++i){
         auto &f = funcs[i];
         size_t const iprivate = f.func.private_dim(),
-          private_offset = f.par_start;
+               private_offset = f.par_start;
 
         lp::mat_vec_dot(f.B, val, val + private_offset, res,
                         res + private_offset, global_dim, iprivate);
@@ -548,26 +548,75 @@ public:
 #endif
   }
 
+  /**
+    computes the diagonl of diag(B).
+   */
+  void get_diag(double * x){
+    std::fill(x, x + global_dim, 0.);
+    double * __restrict__ x_priv = x + global_dim;
+
+    for(size_t i = 0; i < funcs.size(); ++i){
+      auto &f = funcs[i];
+      size_t const iprivate = f.func.private_dim();
+
+      // add to the global parameters
+      double const * b_diag = f.B;
+      size_t j = 0L;
+      for(; j <            global_dim; ++j, b_diag += j + 1)
+        x[j] += *b_diag;
+
+      for(; j < iprivate + global_dim; ++j, b_diag += j + 1)
+        *x_priv++ = *b_diag;
+    }
+  }
+
   /***
-    conjugate gradient method. Solves B.y = x where B is the Hessian
-    approximation.
+    conjugate gradient method with diagonal preconditioning. Solves B.y = x
+    where B is the Hessian approximation.
     @param tol convergence threshold.
+    @param max_cg maximum number of conjugate gradient iterations.
+    @param trace controls the amount of tracing information.
    */
   bool conj_grad(double const * __restrict__ x, double * __restrict__ y,
-                 double const tol){
-    double * __restrict__ r   = temp_mem,
-           * __restrict__ p   = r + n_par,
-           * __restrict__ B_p = p + n_par;
+                 double const tol, size_t const max_cg,
+                 int const trace){
+    double * __restrict__ r      = temp_mem,
+           * __restrict__ p      = r   + n_par,
+           * __restrict__ B_p    = p   + n_par,
+           * __restrict__ v      = B_p + n_par,
+           * __restrict__ B_diag = v   + n_par;
+    constexpr bool const do_pre = true;
 
     // setup before first iteration
+    if(do_pre)
+      get_diag(B_diag);
+
+    auto diag_solve = [&](double       * __restrict__ vy,
+                          double const * __restrict__ vx){
+      double * di = B_diag;
+      for(size_t i = 0; i < n_par; ++i)
+        *vy++ = *vx++ / *di++;
+    };
+
     std::fill(y, y + n_par, 0.);
     for(size_t i = 0; i < n_par; ++i){
       r[i] = -x[i];
-      p[i] =  x[i];
+      if(!do_pre)
+        p[i] = x[i];
     }
 
-    double old_r_dot = lp::vec_dot(r, n_par);
-    for(size_t i = 0; i < n_par; ++i){
+    if(do_pre){
+      diag_solve(v, r);
+      for(size_t i = 0; i < n_par; ++i)
+        p[i] = -v[i];
+    }
+
+    auto get_r_v_dot = [&](){
+      return do_pre ? lp::vec_dot(r, v, n_par) : lp::vec_dot(r, n_par);
+    };
+
+    double old_r_v_dot = get_r_v_dot();
+    for(size_t i = 0; i < max_cg; ++i){
       ++n_cg;
       std::fill(B_p, B_p + n_par, 0.);
       B_vec(p, B_p);
@@ -582,22 +631,27 @@ public:
 
         break;
       }
-      double const alpha = old_r_dot / p_B_p;
+      double const alpha = old_r_v_dot / p_B_p;
 
       for(size_t j = 0; j < n_par; ++j){
         y[j] += alpha *   p[j];
         r[j] += alpha * B_p[j];
       }
 
-      double const r_dot = lp::vec_dot(r, n_par);
-      if(sqrt(abs(r_dot)) < tol)
+      if(do_pre)
+        diag_solve(v, r);
+      double const r_v_dot = get_r_v_dot(),
+                   t_val   = do_pre ? sqrt(abs(lp::vec_dot(r, n_par))) :
+                                      sqrt(abs(r_v_dot));
+      Reporter::cg_it(trace, i, max_cg, t_val, tol);
+      if(t_val < tol)
         break;
 
-      double const beta = r_dot / old_r_dot;
-      old_r_dot = r_dot;
+      double const beta = r_v_dot / old_r_v_dot;
+      old_r_v_dot = r_v_dot;
       for(size_t j = 0; j < n_par; ++j){
         p[j] *= beta;
-        p[j] -= r[j];
+        p[j] -= do_pre ? v[j] : r[j];
       }
     }
 
@@ -764,12 +818,15 @@ public:
    @param trace integer with info level passed to reporter.
    @param cg_tol threshold for conjugate gradient method.
    @param strong_wolfe true if the strong Wolfe condition should be used.
+   @param max_cg maximum number of conjugate gradient iterations in each
+   iteration. Use zero if there should not be a limit.
    */
   optim_info optim
     (double * val, double const rel_eps, size_t const max_it,
      double const c1, double const c2,
      bool const use_bfgs = true, int const trace = 0,
-     double const cg_tol = .5, bool const strong_wolfe = true){
+     double const cg_tol = .5, bool const strong_wolfe = true,
+     size_t const max_cg = 0){
     reset_counters();
     for(auto &f : funcs){
       f.reset();
@@ -795,8 +852,9 @@ public:
 
       double const fval_old = fval,
                      gr_nom = sqrt(abs(lp::vec_dot(gr.get(), n_par))),
-                 cg_tol_use = std::min(cg_tol, gr_nom) * gr_nom;
-      if(!conj_grad(gr.get(), dir.get(), cg_tol_use)){
+                 cg_tol_use = std::min(cg_tol, sqrt(gr_nom)) * gr_nom;
+      if(!conj_grad(gr.get(), dir.get(), cg_tol_use,
+                    max_cg < 1 ? n_par : max_cg, trace)){
         info = info_code::conjugate_gradient_failed;
         Reporter::cg(trace, i, n_cg, false);
         break;

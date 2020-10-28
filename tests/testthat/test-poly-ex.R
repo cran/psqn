@@ -29,8 +29,10 @@ cluster_dat <- readRDS(f)
 test_that("Poly example gives the same", {
   skip_if_not_installed("Rcpp")
   skip_if_not_installed("RcppArmadillo")
+  skip_on_macOS()
 
   Rcpp::sourceCpp(system.file("poly-ex.cpp", package = "psqn"))
+
   optimizer <- get_poly_optimizer(
     cluster_dat, max_threads = 2L, mu_global = mu_global)
 
