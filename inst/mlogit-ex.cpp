@@ -1,17 +1,28 @@
-// we will use openMP to perform the comptutation in parallel
+// we will use OpenMP to perform the computation in parallel
 // [[Rcpp::plugins(openmp, cpp11)]]
 
 // we use RcppArmadillo to simplify the code
 // [[Rcpp::depends(RcppArmadillo)]]
 #include <RcppArmadillo.h>
 
+// we change the unsigned integer type that is used by the package by defining
+// the PSQN_SIZE_T macro variable
+#define PSQN_SIZE_T unsigned int
+
+// we want to use the incomplete Cholesky factorization as the preconditioner
+// and therefore with need RcppEigen
+#define PSQN_USE_EIGEN
+// [[Rcpp::depends(RcppEigen)]]
+
 // [[Rcpp::depends(psqn)]]
-#include "psqn.h"
+#include "psqn-Rcpp-wrapper.h"
 #include "psqn-reporter.h"
+#include "psqn.h"
 using namespace Rcpp;
+using PSQN::psqn_uint; // the unsigned integer type used in the package
 
 /// simple function to avoid copying a vector. You can ignore this
-inline arma::vec vec_no_cp(double const * x, size_t const n_ele){
+inline arma::vec vec_no_cp(double const * x, psqn_uint const n_ele){
   return arma::vec(const_cast<double *>(x), n_ele, false);
 }
 
@@ -38,11 +49,11 @@ public:
   Sigma_inv(as<arma::mat>(data["Sigma_inv"])) { }
 
   /// dimension of the global parameters
-  size_t global_dim() const {
+  psqn_uint global_dim() const {
     return X.n_rows;
   }
   /// dimension of the private parameters
-  size_t private_dim() const {
+  psqn_uint private_dim() const {
     return Z.n_rows;
   }
 
@@ -55,7 +66,7 @@ public:
                        u = vec_no_cp(point + X.n_rows, Z.n_rows);
 
     double out(0);
-    for(size_t i = 0; i < y.n_elem; ++i){
+    for(psqn_uint i = 0; i < y.n_elem; ++i){
       double const eta =
         arma::dot(beta, X.col(i)) + arma::dot(u, Z.col(i));
       out -= y[i] * eta - log(1 + exp(eta));
@@ -82,7 +93,7 @@ public:
               du   (gr + beta.n_elem, u.n_elem   , false);
 
     double out(0);
-    for(size_t i = 0; i < y.n_elem; ++i){
+    for(psqn_uint i = 0; i < y.n_elem; ++i){
       arma::vec const xi = X.unsafe_col(i),
                       zi = Z.unsafe_col(i);
       double const eta = arma::dot(beta, xi) + arma::dot(u, zi),
@@ -119,7 +130,7 @@ using mlogit_topim = PSQN::optimizer<m_logit_func, PSQN::R_reporter,
  */
 // [[Rcpp::export]]
 SEXP get_mlogit_optimizer(List data, unsigned const max_threads){
-  size_t const n_elem_funcs = data.size();
+  psqn_uint const n_elem_funcs = data.size();
   std::vector<m_logit_func> funcs;
   funcs.reserve(n_elem_funcs);
   for(auto dat : data)
@@ -149,7 +160,8 @@ SEXP get_mlogit_optimizer(List data, unsigned const max_threads){
  @param max_cg maximum number of conjugate gradient iterations in each
  iteration. Use zero if there should not be a limit.
  @param pre_method preconditioning method in conjugate gradient method.
- zero yields no preconditioning and one yields diagonal preconditioning.
+ zero yields no preconditioning, one yields diagonal preconditioning, and
+ two yields the incomplete Cholesky factorization from Eigen.
  */
 // [[Rcpp::export]]
 List optim_mlogit
@@ -157,11 +169,11 @@ List optim_mlogit
    unsigned const n_threads, double const c1,
    double const c2, bool const use_bfgs = true, int const trace = 0L,
    double const cg_tol = .5, bool const strong_wolfe = true,
-   size_t const max_cg = 0L, int const pre_method = 1L){
+   psqn_uint const max_cg = 0L, int const pre_method = 1L){
   XPtr<mlogit_topim> optim(ptr);
 
   // check that we pass a parameter value of the right length
-  if(optim->n_par != static_cast<size_t>(val.size()))
+  if(optim->n_par != static_cast<psqn_uint>(val.size()))
     throw std::invalid_argument("optim_mlogit: invalid parameter size");
 
   NumericVector par = clone(val);
@@ -197,7 +209,7 @@ NumericVector optim_mlogit_private
   XPtr<mlogit_topim> optim(ptr);
 
   // check that we pass a parameter value of the right length
-  if(optim->n_par != static_cast<size_t>(val.size()))
+  if(optim->n_par != static_cast<psqn_uint>(val.size()))
     throw std::invalid_argument("optim_mlogit_private: invalid parameter size");
 
   NumericVector par = clone(val);
@@ -219,7 +231,7 @@ double eval_mlogit(NumericVector val, SEXP ptr, unsigned const n_threads){
   XPtr<mlogit_topim> optim(ptr);
 
   // check that we pass a parameter value of the right length
-  if(optim->n_par != static_cast<size_t>(val.size()))
+  if(optim->n_par != static_cast<psqn_uint>(val.size()))
     throw std::invalid_argument("eval_mlogit: invalid parameter size");
 
   optim->set_n_threads(n_threads);
@@ -239,7 +251,7 @@ NumericVector grad_mlogit(NumericVector val, SEXP ptr,
   XPtr<mlogit_topim> optim(ptr);
 
   // check that we pass a parameter value of the right length
-  if(optim->n_par != static_cast<size_t>(val.size()))
+  if(optim->n_par != static_cast<psqn_uint>(val.size()))
     throw std::invalid_argument("grad_mlogit: invalid parameter size");
 
   NumericVector grad(val.size());
@@ -261,4 +273,13 @@ NumericMatrix get_Hess_approx_mlogit(SEXP ptr){
   optim->get_hess(&out[0]);
 
   return out;
+}
+
+/***
+ returns the current Hessian approximation as a sparse matrix.
+ @param ptr returned object from get_mlogit_optimizer.
+ */
+// [[Rcpp::export]]
+Eigen::SparseMatrix<double> get_sparse_Hess_approx_mlogit(SEXP ptr){
+  return XPtr<mlogit_topim>(ptr)->get_hess_sparse();
 }

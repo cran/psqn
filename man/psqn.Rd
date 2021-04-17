@@ -27,7 +27,7 @@ psqn(
 vector of the global parameters and all the private parameters.}
 
 \item{fn}{Function to compute the element functions and their
-derivatives. Each call computes on element function. See the examples
+derivatives. Each call computes an element function. See the examples
 section.}
 
 \item{n_ele_func}{Number of element functions.}
@@ -52,11 +52,12 @@ optimization.}
 \item{env}{Environment to evaluate \code{fn} in. \code{NULL} yields the
 global environment.}
 
-\item{max_cg}{maximum number of conjugate gradient iterations in each
+\item{max_cg}{Maximum number of conjugate gradient iterations in each
 iteration. Use zero if there should not be a limit.}
 
-\item{pre_method}{preconditioning method in conjugate gradient method.
-zero yields no preconditioning and one yields diagonal preconditioning.}
+\item{pre_method}{Preconditioning method in the conjugate gradient method.
+Zero yields no preconditioning, one yields diagonal preconditioning, and
+two yields the incomplete Cholesky factorization from Eigen.}
 }
 \value{
 An object with the following elements:
@@ -83,15 +84,28 @@ in the psqn vignette. See \code{vignette("psqn", package = "psqn")}.
 The partially separable function we consider are special in that the
 function to be minimized is a sum of so-called element functions which
 only depend on few shared (global) parameters and some
-private parameters which are particular to each element function.
+private parameters which are particular to each element function. A generic
+method for other partially separable functions is available through the
+\code{\link{psqn_generic}} function.
 
 The optimization function is also available in C++ as a header-only
 library. Using C++ may reduce the computation time substantially. See
 the vignette in the package for examples.
+
+You have to define the \code{PSQN_USE_EIGEN} macro variable in C++ if you want
+to use the incomplete Cholesky factorization from Eigen. You will also have
+to include Eigen or RcppEigen. This is not needed when you use the R
+functions documented here. The incomplete Cholesky factorization comes
+with some additional overhead because of the allocations of the
+factorization,
+forming the factorization, and the assignment of the sparse version of
+the Hessian approximation.
+However, it may substantially reduce the required number of conjugate
+gradient iterations.
 }
 \examples{
-# example with inner problem in a Taylor approximation for a mixed GLMM as
-# in the vignette
+# example with inner problem in a Taylor approximation for a GLMM as in the
+# vignette
 
 # assign model parameters, number of random effects, and fixed effects
 q <- 2 # number of private parameters per cluster
@@ -166,4 +180,7 @@ c(sapply(sim_dat, "[[", "u"))
 \references{
 Nocedal, J. and Wright, S. J. (2006). \emph{Numerical Optimization}
 (2nd ed.). Springer.
+
+Lin, C. and Moré, J. J. (1999). \emph{Incomplete Cholesky factorizations
+with limited memory}. SIAM Journal on Scientific Computing.
 }
