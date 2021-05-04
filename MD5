@@ -1,6 +1,6 @@
-b8e159eb401f5e52b03c4e24bf15b5fb *DESCRIPTION
+97f336a87fc1e60965cf540e3dc15f60 *DESCRIPTION
 cf3ee08f3c0438f6b2a740185094d8ff *NAMESPACE
-23dedc1b118b57de6237e2714ac48816 *NEWS
+5b444b0ec717bb53d0e2ebcfdfbdd070 *NEWS
 16cb6ea0495e0b5a12ab417f9465dbd4 *R/RcppExports.R
 adf38e22bae51c8aa817b52ebaefa48f *R/catch-routine-registration.R
 6d9437282d616bc510bc202cdd67638b *R/psqn-package.R
@@ -32,7 +32,7 @@ e841e0adb2a89df2e1046d095db426a2 *src/test-intrapolate.cpp
 c2cb0c30e10da611f9fbe56aea52f7a9 *src/test-runner.cpp
 b9f3e6efc7e7800f0004766ad740bafe *tests/testthat.R
 9b2953423baec739fef2382498302fd6 *tests/testthat/GLM-generic-data.RDS
-93016aedf148c7c2a21ede4931f8ff6d *tests/testthat/helper.R
+13293f79c6af9e1fdcbb8920b67273ff *tests/testthat/helper.R
 836043577c3483b437d150de478e4df3 *tests/testthat/mixed-logit.RDS
 cd6f10b6ce25da73f273d6a77725929e *tests/testthat/mlogit-ex-hess-res.RDS
 b2802094f1535a4417975ecb98a0ff98 *tests/testthat/poly.RDS
@@ -40,10 +40,11 @@ b2802094f1535a4417975ecb98a0ff98 *tests/testthat/poly.RDS
 0a6ebff7591d58bec240c924b726657f *tests/testthat/psqn_generic-glm-res.RDS
 0a6ebff7591d58bec240c924b726657f *tests/testthat/psqn_generic-glmm-res.RDS
 7f8b1091fa0d5828f4f32f47d9c331a1 *tests/testthat/test-R-api.R
-5cc8728ba8198cb5573e4f179d04eb87 *tests/testthat/test-cpp-api.R
+7c5e23c22dc9f89351a242fa0a36576a *tests/testthat/test-cpp-api.R
 2e8d4a312ad69e23d012d59142aa764a *tests/testthat/test-cpp.R
-4d1239ab16b2ef595dbd84bc95f510f8 *tests/testthat/test-poly-ex.R
+29bd47f0a77fcf4883d0d9a3913811cd *tests/testthat/test-poly-ex.R
 983fe475fa7d530b11acde8f0c00aa83 *tests/testthat/test-psqn-bfgs.R
-6cfd1b59299f2cf72590a233659d2b3d *tests/testthat/test-psqn-generic.R
+01fa6054ae198b0adf3fa3ebd9a2ebd8 *tests/testthat/test-psqn-generic.R
+3f9e7918c158537beeaa09506d978f25 *tests/testthat/z-undo-helper.R
 48d7514b9a819dc377eb22966029e356 *vignettes/psqn.html.asis
 c37b662b3151b2a83be073ab07034a40 *vignettes/quick-intro.html.asis
