@@ -31,13 +31,21 @@ enum info_code : int {
 enum precondition : int {
    non = 0,
    diag = 1,
-   choleksy = 2
+   choleksy = 2,
+   custom = 3
 };
 
 struct optim_info {
   double value;
   info_code info;
   psqn_uint n_eval, n_grad, n_cg;
+};
+
+struct optim_info_aug_Lagrang {
+   double value;
+   info_code info;
+   psqn_uint n_eval, n_grad, n_cg, n_aug_Lagrang;
+   double penalty;
 };
 
 struct dummy_reporter {

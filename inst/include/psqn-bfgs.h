@@ -20,7 +20,7 @@ class problem {
 public:
   /** returns the number of parameters. */
   virtual psqn_uint size() const = 0;
-  /** returns evalutes the function at val. */
+  /** returns evaluates the function at val. */
   virtual double func(double const *val) = 0;
   /** evaluates the function and compute the gradient. */
   virtual double grad(double const * PSQN_RESTRICT val,
@@ -37,13 +37,15 @@ public:
  @param c1,c2 thresholds for Wolfe condition.
  @param strong_wolfe true if the strong Wolfe condition should be used.
  @param trace controls the amount of tracing information.
+ @param gr_tol convergence tolerance for the Euclidean norm of the gradient. A negative
+ value yields no check.
  */
 template<class Reporter = dummy_reporter,
          class interrupter = dummy_interrupter>
 optim_info bfgs(
     problem &prob, double *val, double const rel_eps = .00000001,
     psqn_uint const max_it = 100, double const c1 = .0001,
-    double const c2 = .9, int const trace = 0L){
+    double const c2 = .9, int const trace = 0L, double const gr_tol = -1){
   // allocate the memory we need
   /* non-const due to
    *    https://www.mail-archive.com/gcc-bugs@gcc.gnu.org/msg531670.html */
@@ -98,13 +100,13 @@ optim_info bfgs(
     if(!all_unchanged){
       lp::vec_diff(gr , gr_old, y, n_ele);
 
-      double const s_y = lp::vec_dot(y, s, n_ele);
+      double const s_y = lp::vec_dot<false>(y, s, n_ele);
       if(s_y > 0){
         // TODO: implement damped BFGS?
         if(first_call){
           first_call = false;
           // make update on page 143
-          double const scal = s_y / lp::vec_dot(y, n_ele);
+          double const scal = s_y / lp::vec_dot<false>(y, n_ele);
           double *h = H;
           for(psqn_uint i = 0; i < n_ele; ++i, h += i + 1)
             *h = scal;
@@ -112,7 +114,7 @@ optim_info bfgs(
 
         std::fill(wrk, wrk + n_ele, 0.);
         lp::mat_vec_dot(H, y, wrk, n_ele);
-        double const y_H_y = lp::vec_dot(y, wrk, n_ele);
+        double const y_H_y = lp::vec_dot<false>(y, wrk, n_ele);
         lp::bfgs_update(H, s, wrk, y_H_y, 1. / s_y, n_ele);
 
       } else
@@ -146,16 +148,16 @@ optim_info bfgs(
         x_mem[i] = x0[i] + alpha * dir[i];
       ++n_grad;
       fnew = prob.grad(const_cast<double const *>(x_mem), gr0);
-      return lp::vec_dot(gr0, dir, n_ele);
+      return lp::vec_dot<false>(gr0, dir, n_ele);
     };
 
     // the above at alpha = 0
-    double dpsi_zero = lp::vec_dot(gr0, dir, n_ele);
+    double dpsi_zero = lp::vec_dot<false>(gr0, dir, n_ele);
     if(dpsi_zero > 0)
       // not a descent direction
       return false;
 
-    constexpr double const NaNv = std::numeric_limits<double>::quiet_NaN();
+    constexpr double NaNv = std::numeric_limits<double>::quiet_NaN();
     auto zoom =
       [&](double a_low, double a_high, intrapolate &inter) -> bool {
         double f_low = psi(a_low);
@@ -282,7 +284,7 @@ optim_info bfgs(
       *d *= -1;
 
     double const x1 = *val;
-    constexpr psqn_uint const n_print(100L);
+    constexpr psqn_uint n_print(100L);
     if(!line_search(fval_old, val, gr, dir, fval)){
       info = info_code::line_search_failed;
       Reporter::line_search
@@ -301,7 +303,9 @@ optim_info bfgs(
     }
 
     bool const has_converged =
-      abs(fval - fval_old) < rel_eps * (abs(fval_old) + rel_eps);
+      abs(fval - fval_old) < rel_eps * (abs(fval_old) + rel_eps) &&
+      // TODO: implement something like BLAS nrm2 function
+      (gr_tol <= 0 || lp::vec_dot<false>(gr, n_ele) < gr_tol * gr_tol);
     if(has_converged){
       info = info_code::converged;
       break;

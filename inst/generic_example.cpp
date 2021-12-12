@@ -116,7 +116,8 @@ List optim_generic_ex
    unsigned const n_threads, double const c1,
    double const c2, bool const use_bfgs = true, int const trace = 0L,
    double const cg_tol = .5, bool const strong_wolfe = true,
-   psqn_uint const max_cg = 0L, int const pre_method = 1L){
+   psqn_uint const max_cg = 0L, int const pre_method = 1L,
+   double const gr_tol = -1){
   XPtr<generic_opt> optim(ptr);
 
   // check that we pass a parameter value of the right length
@@ -127,7 +128,8 @@ List optim_generic_ex
   optim->set_n_threads(n_threads);
   auto res = optim->optim(&par[0], rel_eps, max_it, c1, c2,
                           use_bfgs, trace, cg_tol, strong_wolfe, max_cg,
-                          static_cast<PSQN::precondition>(pre_method));
+                          static_cast<PSQN::precondition>(pre_method),
+                          gr_tol);
   NumericVector counts = NumericVector::create(
     res.n_eval, res.n_grad,  res.n_cg);
   counts.names() = CharacterVector::create("function", "gradient", "n_cg");
@@ -180,4 +182,28 @@ NumericMatrix get_Hess_approx_generic(SEXP ptr){
 // [[Rcpp::export]]
 Eigen::SparseMatrix<double> get_sparse_Hess_approx_generic(SEXP ptr){
   return XPtr<generic_opt>(ptr)->get_hess_sparse();
+}
+
+// [[Rcpp::export]]
+Eigen::SparseMatrix<double> true_hess_sparse
+  (SEXP ptr, NumericVector val, double const eps = 0.001, double const scale = 2,
+   double const tol = 0.000000001, unsigned const order = 6){
+
+  XPtr<generic_opt> optim(ptr);
+
+  // check that we pass a parameter value of the right length
+  if(optim->n_par != static_cast<psqn_uint>(val.size()))
+    throw std::invalid_argument("true_hess_sparse: invalid parameter size");
+
+  return optim->true_hess_sparse(&val[0], eps, scale, tol, order);
+}
+
+// [[Rcpp::export]]
+void set_masked(SEXP ptr, Rcpp::IntegerVector indices){
+  XPtr<generic_opt>(ptr)->set_masked(indices.begin(), indices.end());
+}
+
+// [[Rcpp::export]]
+void clear_masked(SEXP ptr){
+  XPtr<generic_opt>(ptr)->clear_masked();
 }

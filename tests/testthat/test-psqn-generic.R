@@ -47,6 +47,29 @@ test_that("the R and C++ interface gives the same and correct result", {
 
   expect_known_value(R_res[c("par", "value")], "psqn_generic-glm-res.RDS")
 
+  idx_mask <- c(2L, 5L, 19L)
+  R_res_mask <- psqn_generic(
+    par = numeric(K), fn = r_func, n_ele_func = length(dat), c1 = 1e-4, c2 = .1,
+    trace = 0L, rel_eps = 1e-9, max_it = 1000L, env = environment(),
+    mask = idx_mask)
+  expect_known_value(R_res_mask[c("par", "value")],
+                     "psqn_generic-glm-res-mask.RDS")
+
+  # check the Hessian
+  true_hess <- readRDS("psqn_generic-hess-res.RDS")
+  expect_equal(
+    as.matrix(psqn_generic_hess(
+      R_res_mask$par, fn = r_func, n_ele_func = length(dat))),
+    true_hess, check.attributes = FALSE)
+
+  # check for an error message
+  expect_error(
+    R_res <- psqn_generic(
+      par = numeric(K), fn = r_func, n_ele_func = length(dat), c1 = 1e-4, c2 = .1,
+      trace = 0L, rel_eps = 1e-9, max_it = 1000L, env = environment(),
+      pre_method = 3L),
+    "there is no custom preconditioner")
+
   # check that the C++ version gives the same
   skip_if_not_installed("Matrix")
   skip_on_macOS()
@@ -61,7 +84,7 @@ test_that("the R and C++ interface gives the same and correct result", {
     x$indices <- x$indices - 1L # C++ needs zero-based indices
     x
   })
-  ptr <- get_generic_ex_obj(cpp_arg, max_threads = 4L)
+  ptr <- get_generic_ex_obj(cpp_arg, max_threads = 2L)
   Cpp_res <- optim_generic_ex(
     val = numeric(K), ptr = ptr, rel_eps = 1e-9, max_it = 1000L,
     n_threads = 1L, c1 = 1e-4, c2 = .1, trace = 0L, cg_tol = .5)
@@ -74,11 +97,36 @@ test_that("the R and C++ interface gives the same and correct result", {
   expect_equal(as.matrix(hess_ress_sparse), hess_ress,
                check.attributes = FALSE)
 
+  # check the true Hessian
+  # truth <- numDeriv::jacobian(grad_generic_ex, ptr = ptr, n_threads = 1L,
+  #                             R_res_mask$par)
+  # saveRDS(truth, "psqn_generic-hess-res.RDS")
+  true_hess <- readRDS("psqn_generic-hess-res.RDS")
+  expect_equal(
+    as.matrix(true_hess_sparse(ptr, R_res_mask$par)),
+    true_hess, check.attributes = FALSE)
+
   # we get the same with more threads
   Cpp_res <- optim_generic_ex(
     val = numeric(K), ptr = ptr, rel_eps = 1e-9, max_it = 1000L,
     n_threads = 2L, c1 = 1e-4, c2 = .1, trace = 0L, cg_tol = .5)
   expect_equal(Cpp_res, R_res)
+
+  set_masked(ptr, idx_mask)
+  Cpp_res_mask <- optim_generic_ex(
+    val = numeric(K), ptr = ptr, rel_eps = 1e-9, max_it = 1000L,
+    n_threads = 2L, c1 = 1e-4, c2 = .1, trace = 0L, cg_tol = .5)
+  expect_equal(Cpp_res_mask, R_res_mask)
+  clear_masked(ptr)
+
+  # the gradient tolerance works
+  gr_tol <- 1e-6
+  Cpp_res <- optim_generic_ex(
+    val = numeric(K), ptr = ptr, rel_eps = 1, max_it = 1000L,
+    n_threads = 2L, c1 = 1e-4, c2 = .1, trace = 0L, cg_tol = .5,
+    gr_tol = gr_tol)
+  expect_lt(sqrt(sum(grad_generic_ex(Cpp_res$par, ptr, 1)^2)),
+            gr_tol)
 
   # we the right result with other preconditioners
   for(i in 0:2){
@@ -119,5 +167,13 @@ test_that("the R and C++ interface gives the same and correct result", {
       val = numeric(K), ptr = ptr, rel_eps = 1e-9, max_it = 1000L,
       n_threads = 1L, c1 = 1e-4, c2 = .1, trace = 0L, cg_tol = .5)
     expect_equal(Cpp_res$value, R_res$value)
+
+    # check for an error message
+    expect_error(
+      optim_generic_ex(
+        val = numeric(K), ptr = ptr, rel_eps = 1e-9, max_it = 1000L,
+        n_threads = 1L, c1 = 1e-4, c2 = .1, trace = 0L, cg_tol = .5,
+        pre_method = 3L),
+      "there is no custom preconditioner")
   })()
 })

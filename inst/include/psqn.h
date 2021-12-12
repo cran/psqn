@@ -12,6 +12,7 @@
 #include "intrapolate.h"
 #include "psqn-misc.h"
 #include "psqn-bfgs.h"
+#include "richardson-extrapolation.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -32,25 +33,48 @@ inline void throw_no_eigen_error(){
  */
 class base_worker {
   /// logical for whether it is the first call
-  bool first_call = true;
-
+  bool first_call{true};
 public:
+  /// memory for the Hessian approximation
+  double * PSQN_RESTRICT B{nullptr};
+  /// memory for the gradient
+  double * PSQN_RESTRICT gr{nullptr};
+  /// memory for the old gradient
+  double * PSQN_RESTRICT gr_old{nullptr};
+  /// memory for the old value
+  double * PSQN_RESTRICT x_old{nullptr};
+  /// memory for the current value
+  double * PSQN_RESTRICT x_new{nullptr};
+
+  /// returns the required number of permanent memory
+  static size_t n_perm_mem(size_t const n_ele){
+    return (n_ele * (n_ele + 1)) / 2L + 4 * n_ele;
+  }
+
+  /// returns the required number of temporary memory
+  static size_t n_temp_mem(size_t const n_ele){
+    return 3 * n_ele;
+  }
+
+  /// sets the working memory
+  void set_working_memory(double * mem){
+    first_call = true;
+    B = mem;
+    gr = B + (n_ele * (n_ele + 1)) / 2L;
+    gr_old = gr + n_ele;
+    x_old = gr_old + n_ele;
+    x_new = x_old + n_ele;
+  }
+
   /// number of elements
   psqn_uint const n_ele;
-  /// memory for the Hessian approximation
-  double * const PSQN_RESTRICT B;
-  /// memory for the gradient
-  double * const PSQN_RESTRICT gr = B + (n_ele * (n_ele + 1)) / 2L;
-  /// memory for the old gradient
-  double * const PSQN_RESTRICT gr_old = gr + n_ele;
-  /// memory for the old value
-  double * const PSQN_RESTRICT x_old = gr_old + n_ele;
-  /// memory for the current value
-  double * const PSQN_RESTRICT x_new = x_old + n_ele;
   /// bool for whether to use BFGS or SR1 updates
   bool use_bfgs = true;
 
-  base_worker(psqn_uint const n_ele, double * mem): n_ele(n_ele), B(mem) { }
+  base_worker(psqn_uint const n_ele, double * mem = nullptr):
+    n_ele(n_ele) {
+    if(mem) set_working_memory(mem);
+  }
   virtual ~base_worker() = default;
 
   /***
@@ -100,11 +124,11 @@ public:
       lp::vec_diff(gr, gr_old, y, n_ele);
 
       if(use_bfgs){
-        double const s_y = lp::vec_dot(y, s, n_ele);
+        double const s_y = lp::vec_dot<false>(y, s, n_ele);
         if(first_call){
           first_call = false;
           // make update on page 143
-          double const scal = lp::vec_dot(y, n_ele) / s_y;
+          double const scal = lp::vec_dot<false>(y, n_ele) / s_y;
           double *b = B;
           for(psqn_uint i = 0; i < n_ele; ++i, b += i + 1)
             *b = scal;
@@ -113,7 +137,7 @@ public:
         // perform BFGS update
         std::fill(wrk, wrk + n_ele, 0.);
         lp::mat_vec_dot(B, s, wrk, n_ele);
-        double const s_B_s = lp::vec_dot(s, wrk, n_ele);
+        double const s_B_s = lp::vec_dot<false>(s, wrk, n_ele);
 
         lp::rank_one_update(B, wrk, -1. / s_B_s, n_ele);
 
@@ -124,7 +148,7 @@ public:
             *wi = wrk;
           for(psqn_uint i = 0; i < n_ele; ++i, ++yi, ++wi)
             *yi = theta * *yi + (1 - theta) * *wi;
-          double const s_r = lp::vec_dot(y, s, n_ele);
+          double const s_r = lp::vec_dot<false>(y, s, n_ele);
           lp::rank_one_update(B, y, 1. / s_r, n_ele);
 
         } else
@@ -136,7 +160,7 @@ public:
           first_call = false;
           // make update on page 143
           double const scal =
-            lp::vec_dot(y, n_ele) / lp::vec_dot(y, s, n_ele);
+            lp::vec_dot<false>(y, n_ele) / lp::vec_dot<false>(y, s, n_ele);
           double *b = B;
           for(psqn_uint i = 0; i < n_ele; ++i, b += i + 1)
             *b = scal;
@@ -149,10 +173,10 @@ public:
           wrk[i] *= -1;
           wrk[i] += y[i];
         }
-        double const s_w = lp::vec_dot(s, wrk, n_ele),
-          s_norm = sqrt(abs(lp::vec_dot(s, n_ele))),
-          wrk_norm = sqrt(abs(lp::vec_dot(wrk, n_ele)));
-        constexpr double const r = 1e-8;
+        double const s_w = lp::vec_dot<false>(s, wrk, n_ele),
+                  s_norm = sqrt(abs(lp::vec_dot<false>(s, n_ele))),
+                wrk_norm = sqrt(abs(lp::vec_dot<false>(wrk, n_ele)));
+        constexpr double r = 1e-8;
         if(abs(s_w) > r * s_norm * wrk_norm)
           lp::rank_one_update(B, wrk, 1. / s_w, n_ele);
 
@@ -217,30 +241,52 @@ struct default_caller {
    @param val pointer to the value to evaluate the function at.
    @param comp_grad true if eval_grad is going to be called.
    */
-  inline void setup(double const *val, bool const comp_grad) { }
+  void setup(double const *val, bool const comp_grad) { }
 
   template<class T>
-  inline double eval_func(T &obj, double const * val) {
+  double eval_func(T &obj, double const * val) {
     return obj.func(val);
   }
 
   template<class T>
-  inline double eval_grad(T &obj, double const * val, double *gr) {
+  double eval_grad(T &obj, double const * val, double *gr) {
     return obj.grad(val, gr);
   }
 };
 
 /***
  template class to perform parts of the optimization that is common to
- different particular optimizers. The reporter class can be used to report
- results during the optimization.
+ different particular optimizers. Uses CRTP.
  */
-template<class OptT, class Reporter = dummy_reporter>
-class optimizer_internals {
-  OptT * const opt_obj = nullptr;
-  double * const temp_mem = nullptr;
-  psqn_uint const n_par = 0L;
-public:
+template<class OptT, class Tconstraint>
+class base_optimizer {
+  OptT & opt_obj(){
+    return *static_cast<OptT*>(this);
+  }
+
+  double * temp_mem() {
+    return opt_obj().get_internals_mem();
+  }
+
+  psqn_uint n_par() {
+    return opt_obj().n_par;
+  }
+
+  std::vector<bool> & masked_parameters() {
+    return opt_obj().masked_parameters;
+  }
+  std::vector<bool> const & masked_parameters() const {
+    return opt_obj().masked_parameters;
+  }
+
+  bool & any_masked() {
+    return opt_obj().any_masked;
+  }
+  bool any_masked() const {
+    return opt_obj().any_masked;
+  }
+
+protected:
   /// number of function evaluations
   psqn_uint n_eval = 0L;
   /// number of gradient evaluations
@@ -257,26 +303,153 @@ public:
     n_cg = 0L;
   }
 
-  optimizer_internals(OptT *opt_obj):
-    opt_obj(opt_obj),
-    temp_mem(opt_obj ? opt_obj->get_internals_mem() : nullptr),
-    n_par(opt_obj ? opt_obj->n_par : 0L)
-    { }
-
   /***
-   evaluates the partially separable and also the gradient if requested.
+   evaluates the partially separable function and also the gradient if
+   requested.
    @param val pointer to the value to evaluate the function at.
    @param gr pointer to store gradient in.
-   @param comp_grad boolean for whether to compute the gradient.
+   @param comp_grad bool for whether to compute the gradient.
    */
-  double eval(double const * val, double * PSQN_RESTRICT gr,
-              bool const comp_grad){
+  double eval_base(double const * val, double * PSQN_RESTRICT gr,
+                   bool const comp_grad){
     if(comp_grad)
       n_grad++;
     else
       n_eval++;
-    return opt_obj->eval(val, gr, comp_grad);
+    double out{opt_obj().eval(val, gr, comp_grad)};
+    out += constraints_terms(val, gr, comp_grad);
+    return out;
   }
+
+  /// adds constraint terms from the augmented Lagrangian function
+  double constraints_terms(double const * val, double * PSQN_RESTRICT gr,
+                           bool const comp_grad){
+    if(!use_constraints)
+      return 0;
+
+    double out(0);
+    sum_violations_sq = 0;
+    for(size_t i = 0; i < constraints.size(); ++i){
+      auto &c = constraints[i];
+      double const constraint_val{c(val, comp_grad)};
+      out += -lagrang_mult[i] * constraint_val +
+        penalty * .5 * constraint_val * constraint_val;
+      sum_violations_sq += constraint_val * constraint_val;
+
+      if(comp_grad){
+        psqn_uint const * idx_j{c.indices()};
+        for(psqn_uint j = 0; j < c.n_constrained(); ++j, ++idx_j){
+          if(opt_obj().any_masked && opt_obj().masked_parameters[*idx_j])
+            c.gr[j] = 0;
+          else {
+            c.gr[j] *= (penalty * constraint_val - lagrang_mult[i]);
+            gr[*idx_j] += c.gr[j];
+          }
+        }
+      }
+    }
+
+    return out;
+  }
+
+  /// should augmented Lagrangian terms be included
+  bool use_constraints{false};
+
+  /// the working memory when using constraints
+  std::unique_ptr<double[]> constraints_wk_mem_ptr;
+  double * PSQN_RESTRICT constraints_wk_mem{nullptr};
+
+  /// the multipliers from the augmented Lagrangian method
+  double * PSQN_RESTRICT lagrang_mult{nullptr};
+  /// the penalty factor from the augmented Lagrangian method
+  double penalty{};
+  /// the sum of the constrain violations squared
+  double sum_violations_sq{};
+
+  /// add diagonal entries from the augmented Lagrangian terms
+  void add_constraints_B_diag(double * PSQN_RESTRICT x){
+    if(!use_constraints)
+      return;
+
+    for(auto &c : constraints){
+      // add the diagonal entries
+      double const * b_diag{c.B};
+      psqn_uint const n_constrained{c.n_constrained()};
+      psqn_uint const * idx_j{c.indices()};
+      for(psqn_uint j = 0; j < n_constrained; ++j, b_diag += j + 1, ++idx_j)
+        x[*idx_j] += *b_diag;
+    }
+  }
+
+  /// accounts for the augmented Lagrangian terms in B.x
+  void add_constraints_B_vec_terms
+    (double const * PSQN_RESTRICT val, double * PSQN_RESTRICT res){
+    if(!use_constraints)
+      return;
+
+    double * const tmp_mem{constraints_wk_mem};
+    for(auto &c : constraints){
+      std::fill(tmp_mem, tmp_mem + c.n_constrained(), 0.);
+      lp::mat_vec_dot(c.B, val, tmp_mem, c.n_constrained(), c.indices());
+
+      psqn_uint const * idx_j{c.indices()};
+      for(psqn_uint j = 0; j < c.n_constrained(); ++j, ++idx_j)
+        res[*idx_j] += tmp_mem[j];
+    }
+  }
+
+  void alloc_n_set_constraint_mem(){
+    // compute the required memory
+    {
+      size_t n_mem{}, max_constraints{};
+
+      for(auto &c : constraints){
+        size_t const n_const = c.n_constrained();
+        n_mem += Tconstraint::n_perm_mem(n_const);
+        max_constraints = std::max(max_constraints, n_const);
+      }
+
+      n_mem += std::max
+        (Tconstraint::n_temp_mem(max_constraints), max_constraints);
+      constraints_wk_mem_ptr.reset(new double[n_mem]);
+    }
+
+    // set the working memory
+    constraints_wk_mem = constraints_wk_mem_ptr.get();
+    for(auto &c : constraints){
+      c.set_working_memory(constraints_wk_mem);
+      constraints_wk_mem += Tconstraint::n_perm_mem(c.n_constrained());
+    }
+  }
+
+#ifdef PSQN_USE_EIGEN
+  /// add the Hessian terms from the augmented Lagrangian terms
+  void add_constraints_to_sparse_hess
+    (Eigen::SparseMatrix<double> &sparse_B_mat){
+    if(!use_constraints)
+      return;
+
+    for(auto &c : constraints){
+      psqn_uint const n_constrained{c.n_constrained()};
+      double const * B = c.B;
+      psqn_uint const * const idx = c.indices();
+      for(psqn_uint j = 0; j < n_constrained; ++j){
+        for(psqn_uint i = 0; i < j; ++i){
+          sparse_B_mat.coeffRef(idx[i], idx[j]) += *B;
+          sparse_B_mat.coeffRef(idx[j], idx[i]) += *B++;
+        }
+        sparse_B_mat.coeffRef(idx[j], idx[j]) += *B++;
+      }
+    }
+  }
+
+#endif // #ifdef PSQN_USE_EIGEN
+
+public:
+  ~base_optimizer() = default;
+
+  /// the current constraints
+  std::vector<Tconstraint> constraints;
 
   /***
     conjugate gradient method with diagonal preconditioning. Solves B.y = x
@@ -289,13 +462,15 @@ public:
   bool conj_grad(double const * PSQN_RESTRICT x, double * PSQN_RESTRICT y,
                  double tol, psqn_uint const max_cg,
                  int const trace, precondition const pre_method){
-    double const x_nom = sqrt(abs(lp::vec_dot(x, n_par))),
-               tol_use = std::min(tol, sqrt(x_nom));
+    double const x_norm = sqrt(abs(lp::vec_dot<true>(x, n_par()))),
+                tol_use = std::min(tol, sqrt(x_norm));
 
     if(pre_method == precondition::choleksy){
 #ifdef PSQN_USE_EIGEN
       Eigen::SparseMatrix<double> &sparse_B_mat =
-        opt_obj->get_hess_sparse_ref();
+        opt_obj().get_hess_sparse_ref();
+      add_constraints_to_sparse_hess(sparse_B_mat);
+
       Eigen::ConjugateGradient
         <Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper,
          Eigen::IncompleteCholesky<double, Eigen::Lower | Eigen::Upper> > cg;
@@ -310,8 +485,8 @@ public:
       cg.setTolerance(tol_use);
 
       // compute and return
-      Eigen::VectorXd rhs(n_par), lhs(n_par);
-      for(psqn_uint i = 0; i < n_par; ++i)
+      Eigen::VectorXd rhs(n_par()), lhs(n_par());
+      for(psqn_uint i = 0; i < n_par(); ++i)
         rhs[i] = x[i];
 
       lhs = cg.solve(rhs);
@@ -320,9 +495,9 @@ public:
       // "missing"
       n_cg += cg.iterations() + 1L;
 
-      Reporter::cg_it(trace, cg.iterations() + 1L, max_cg,
-                      cg.error(), tol_use);
-      for(psqn_uint i = 0; i < n_par; ++i)
+      OptT::Reporter::cg_it(trace, cg.iterations() + 1L, max_cg,
+                            cg.error(), tol_use);
+      for(psqn_uint i = 0; i < n_par(); ++i)
         y[i] = lhs[i];
       return true;
 #else
@@ -332,84 +507,105 @@ public:
     }
 
     // eigen does not include this factor
-    double const eps = tol_use * x_nom;
+    double const eps = tol_use * x_norm;
 
-    double * PSQN_RESTRICT r       = temp_mem,
-           * PSQN_RESTRICT p       = r      + n_par,
-           * PSQN_RESTRICT B_p     = p      + n_par,
-           * PSQN_RESTRICT v       = B_p    + n_par,
-           * PSQN_RESTRICT B_diag  = v      + n_par;
-    bool const do_pre = pre_method == precondition::diag;
+    double * PSQN_RESTRICT r       = temp_mem(),
+           * PSQN_RESTRICT p       = r      + n_par(),
+           * PSQN_RESTRICT B_p     = p      + n_par(),
+           * PSQN_RESTRICT v       = B_p    + n_par(),
+           * PSQN_RESTRICT B_diag  = v      + n_par();
+    bool const do_pre_diag{pre_method == precondition::diag},
+               do_pre_custom{pre_method == precondition::custom},
+               do_pre{do_pre_diag || do_pre_custom};
 
     // setup before first iteration
-    if(do_pre){
-      opt_obj->get_diag(B_diag);
+    if(do_pre_diag){
+      opt_obj().get_diag(B_diag);
+      add_constraints_B_diag(B_diag);
       double *b = B_diag;
-      for(psqn_uint i = 0; i < n_par; ++i, ++b)
+      for(psqn_uint i = 0; i < n_par(); ++i, ++b)
         *b = 1. / *b; // want to use multiplication rather than division
-    }
+    } else if(do_pre_custom)
+      opt_obj().setup_custom_preconditioning();
+
 
     auto diag_solve = [&](double       * PSQN_RESTRICT vy,
                           double const * PSQN_RESTRICT vx) -> void {
       double * di = B_diag;
-      for(psqn_uint i = 0; i < n_par; ++i)
-        *vy++ = *vx++ * *di++;
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+      for(psqn_uint i = 0; i < n_par(); ++i)
+        vy[i] = vx[i] * di[i];
     };
 
-    std::fill(y, y + n_par, 0.);
-    for(psqn_uint i = 0; i < n_par; ++i){
+    std::fill(y, y + n_par(), 0.);
+    for(psqn_uint i = 0; i < n_par(); ++i){
       r[i] = -x[i];
       if(!do_pre)
         p[i] = x[i];
     }
 
-    if(do_pre){
+    if(do_pre_diag){
       diag_solve(v, r);
-      for(psqn_uint i = 0; i < n_par; ++i)
+      for(psqn_uint i = 0; i < n_par(); ++i)
+        p[i] = -v[i];
+    } else if(do_pre_custom){
+      opt_obj().custom_preconditioning(v, const_cast<double const*>(r));
+      for(psqn_uint i = 0; i < n_par(); ++i)
         p[i] = -v[i];
     }
 
     auto get_r_v_dot = [&]() -> double {
-      return do_pre ? lp::vec_dot(r, v, n_par) : lp::vec_dot(r, n_par);
+      return do_pre ? lp::vec_dot<true>(r, v, n_par())
+                    : lp::vec_dot<true>(r, n_par());
     };
 
-    auto comp_B_vec = opt_obj->get_comp_B_vec();
+    auto comp_B_vec = opt_obj().get_comp_B_vec();
 
     double old_r_v_dot = get_r_v_dot();
     for(psqn_uint i = 0; i < max_cg; ++i){
       ++n_cg;
-      std::fill(B_p, B_p + n_par, 0.);
+      std::fill(B_p, B_p + n_par(), 0.);
       comp_B_vec(p, B_p);
+      add_constraints_B_vec_terms(p, B_p);
 
-      double const p_B_p = lp::vec_dot(p, B_p, n_par);
+      double const p_B_p = lp::vec_dot<true>(p, B_p, n_par());
       if(p_B_p <= 0){
         // negative curvature. Thus, exit
         if(i < 1L)
           // set output to be the gradient
-          for(psqn_uint j = 0; j < n_par; ++j)
-            y[j] = x[j];
+          lp::copy(y, x, n_par());
 
         break;
       }
       double const alpha = old_r_v_dot / p_B_p;
 
-      for(psqn_uint j = 0; j < n_par; ++j){
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+      for(psqn_uint j = 0; j < n_par(); ++j){
         y[j] += alpha *   p[j];
         r[j] += alpha * B_p[j];
       }
 
-      if(do_pre)
+      if(do_pre_diag)
         diag_solve(v, r);
+      else if(do_pre_custom)
+        opt_obj().custom_preconditioning(v, const_cast<double const*>(r));
       double const r_v_dot = get_r_v_dot(),
-                   t_val   = do_pre ? sqrt(abs(lp::vec_dot(r, n_par))) :
-                                      sqrt(abs(r_v_dot));
-      Reporter::cg_it(trace, i, max_cg, t_val, eps);
+                   t_val   = do_pre ? sqrt(abs(lp::vec_dot<true>(r, n_par())))
+                                    : sqrt(abs(r_v_dot));
+      OptT::Reporter::cg_it(trace, i, max_cg, t_val, eps);
       if(t_val < eps)
         break;
 
       double const beta = r_v_dot / old_r_v_dot;
       old_r_v_dot = r_v_dot;
-      for(psqn_uint j = 0; j < n_par; ++j){
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+      for(psqn_uint j = 0; j < n_par(); ++j){
         p[j] *= beta;
         p[j] -= do_pre ? v[j] : r[j];
       }
@@ -436,32 +632,38 @@ public:
       double const f0, double * PSQN_RESTRICT x0, double * PSQN_RESTRICT gr0,
       double * PSQN_RESTRICT dir, double &fnew, double const c1,
       double const c2, bool const strong_wolfe, int const trace){
-    double * const x_mem = temp_mem;
+    double * const x_mem = temp_mem();
 
     // declare 1D functions
     auto psi = [&](double const alpha) -> double {
-      for(psqn_uint i = 0; i < n_par; ++i)
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+      for(psqn_uint i = 0; i < n_par(); ++i)
         x_mem[i] = x0[i] + alpha * dir[i];
 
-      return eval(x_mem, nullptr, false);
+      return eval_base(x_mem, nullptr, false);
     };
 
     // returns the function value and the gradient
     auto dpsi = [&](double const alpha) -> double {
-      for(psqn_uint i = 0; i < n_par; ++i)
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+      for(psqn_uint i = 0; i < n_par(); ++i)
         x_mem[i] = x0[i] + alpha * dir[i];
 
-      fnew = eval(x_mem, gr0, true);
-      return lp::vec_dot(gr0, dir, n_par);
+      fnew = eval_base(x_mem, gr0, true);
+      return lp::vec_dot<true>(gr0, dir, n_par());
     };
 
     // the above at alpha = 0
-    double const dpsi_zero = lp::vec_dot(gr0, dir, n_par);
+    double const dpsi_zero = lp::vec_dot<true>(gr0, dir, n_par());
     if(dpsi_zero > 0)
       // not a descent direction
       return false;
 
-    constexpr psqn_uint const max_it = 20L;
+    constexpr psqn_uint max_it = 20L;
     static double const NaNv = std::numeric_limits<double>::quiet_NaN();
     auto zoom =
       [&](double a_low, double a_high, intrapolate &inter) -> bool {
@@ -480,8 +682,8 @@ public:
           }
 
           inter.update(ai, fi);
-          Reporter::line_search_inner(trace, a_low, ai, fi, true,
-                                      NaNv, a_high);
+          OptT::Reporter::line_search_inner(trace, a_low, ai, fi, true,
+                                            NaNv, a_high);
 
           if(fi > f0 + c1 * ai * dpsi_zero or fi >= f_low){
             a_high = ai;
@@ -489,8 +691,8 @@ public:
           }
 
           double const dpsi_i = dpsi(ai);
-          Reporter::line_search_inner(trace, a_low, ai, fi, true,
-                                      dpsi_i, a_high);
+          OptT::Reporter::line_search_inner(trace, a_low, ai, fi, true,
+                                            dpsi_i, a_high);
           double const test_val = strong_wolfe ? abs(dpsi_i) : -dpsi_i;
           if(test_val <= - c2 * dpsi_zero)
             return true;
@@ -514,8 +716,8 @@ public:
     for(psqn_uint i = 0; i < max_it; ++i){
       ai *= mult;
       double fi = psi(ai);
-      Reporter::line_search_inner(trace, a_prev, ai, fi, false,
-                                  NaNv, NaNv);
+      OptT::Reporter::line_search_inner(trace, a_prev, ai, fi, false,
+                                        NaNv, NaNv);
       if(!std::isfinite(fi)){
         // handle inf/nan case
         failed_once = true;
@@ -534,23 +736,23 @@ public:
       if(fi > f0 + c1 * ai * dpsi_zero or (found_ok_prev and fi > fold)){
         intrapolate inter(f0, dpsi_zero, ai, fi);
         bool const out = zoom(a_prev, ai, inter);
-        lp::copy(x0, x_mem, n_par);
+        lp::copy(x0, x_mem, n_par());
         return out;
       }
 
       double const dpsi_i = dpsi(ai);
-      Reporter::line_search_inner(trace, a_prev, ai, fi, false,
-                                  dpsi_i, NaNv);
+      OptT::Reporter::line_search_inner(trace, a_prev, ai, fi, false,
+                                        dpsi_i, NaNv);
 
       double const test_val = strong_wolfe ? abs(dpsi_i) : -dpsi_i;
       if(test_val <= - c2 * dpsi_zero){
-        lp::copy(x0, x_mem, n_par);
+        lp::copy(x0, x_mem, n_par());
         return true;
       }
 
       if(failed_once and fi < f0){
         // effectively just line search
-        lp::copy(x0, x_mem, n_par);
+        lp::copy(x0, x_mem, n_par());
         return false;
       }
 
@@ -566,7 +768,7 @@ public:
           return intrapolate(f0, dpsi_zero, ai, fi);
         })();
         bool const out = zoom(ai, a_prev, inter);
-        lp::copy(x0, x_mem, n_par);
+        lp::copy(x0, x_mem, n_par());
         return out;
       }
 
@@ -577,29 +779,348 @@ public:
 
     return false;
   }
+
+  /***
+   optimizes the partially separable function.
+   @param val pointer to starting value. Set to the final estimate at the
+   end.
+   @param rel_eps relative convergence threshold.
+   @param max_it maximum number of iterations.
+   @param c1,c2 thresholds for Wolfe condition.
+   @param use_bfgs bool for whether to use BFGS updates or SR1 updates.
+   @param trace integer with info level passed to reporter.
+   @param cg_tol threshold for conjugate gradient method.
+   @param strong_wolfe true if the strong Wolfe condition should be used.
+   @param max_cg maximum number of conjugate gradient iterations in each
+   iteration. Use zero if there should not be a limit.
+   @param pre_method preconditioning method.
+   @param gr_tol convergence tolerance for the Euclidean norm of the gradient. A negative
+   value yields no check.
+   */
+  optim_info optim
+    (double * val, double const rel_eps, psqn_uint const max_it,
+     double const c1, double const c2,
+     bool const use_bfgs = true, int const trace = 0,
+     double const cg_tol = .5, bool const strong_wolfe = true,
+     psqn_uint const max_cg = 0,
+     precondition const pre_method = precondition::diag,
+     double const gr_tol = -1){
+    // checks
+    if(c1 < 0)
+      throw std::invalid_argument("c1 < 0");
+    if(c1 >= c2 || c2 >= 1)
+      throw std::invalid_argument("c1 >= c2 || c2 >= 1");
+
+    if(!use_constraints)
+      reset_counters();
+    for(auto &f : opt_obj().funcs){
+      f.reset();
+      f.use_bfgs = use_bfgs;
+    }
+    if(use_constraints)
+      for(auto &c : constraints){
+        c.reset();
+        c.use_bfgs = use_bfgs;
+      }
+
+    std::unique_ptr<double[]> gr(new double[n_par()]),
+                             dir(new double[n_par()]);
+
+    // evaluate the gradient at the current value
+    double fval = eval_base(val, gr.get(), true);
+    for(auto &f : opt_obj().funcs)
+      f.record();
+    if(use_constraints)
+      for(auto &c : constraints)
+        c.record();
+
+    info_code info = info_code::max_it_reached;
+    int n_line_search_fail = 0;
+    for(psqn_uint i = 0; i < max_it; ++i){
+      if(i % 10 == 0)
+        if(OptT::interrupter::check_interrupt()){
+          info = info_code::user_interrupt;
+          break;
+        }
+
+      double const fval_old = fval;
+      if(!conj_grad(gr.get(), dir.get(), cg_tol, max_cg < 1 ? n_par() : max_cg,
+                    trace, pre_method)){
+        info = info_code::conjugate_gradient_failed;
+        OptT::Reporter::cg(trace, i, n_cg, false);
+        break;
+      } else
+        OptT::Reporter::cg(trace, i, n_cg, true);
+
+      for(double * d = dir.get(); d != dir.get() + n_par(); ++d)
+        *d *= -1;
+
+      double const x1 = *val;
+      if(!line_search(fval_old, val, gr.get(), dir.get(), fval, c1, c2,
+                      strong_wolfe, trace)){
+        info = info_code::line_search_failed;
+        OptT::Reporter::line_search
+          (trace, i, n_eval, n_grad, fval_old,
+           fval, false, std::numeric_limits<double>::quiet_NaN(),
+           const_cast<double const *>(val), opt_obj().n_print());
+        if(++n_line_search_fail > 2)
+          break;
+      } else{
+        n_line_search_fail = 0;
+        OptT::Reporter::line_search
+          (trace, i, n_eval, n_grad, fval_old, fval,
+           true, (*val - x1) / *dir.get(), const_cast<double const *>(val),
+           opt_obj().n_print());
+
+      }
+
+      bool const has_converged =
+        abs(fval - fval_old) < rel_eps * (abs(fval_old) + rel_eps)  &&
+        // TODO: implement something like BLAS nrm2 function
+        (gr_tol <= 0 || lp::vec_dot<true>(gr.get(), n_par()) < gr_tol * gr_tol);
+      if(has_converged){
+        info = info_code::converged;
+        break;
+      }
+
+      // update the Hessian and take another iteration
+      if(n_line_search_fail < 1){
+      	opt_obj().update_Hessian_approx();
+        if(use_constraints)
+          for(auto &c : constraints)
+            c.update_Hes(constraints_wk_mem);
+      }
+      else {
+      	opt_obj().reset_Hessian_approx();
+        if(use_constraints)
+          for(auto &c : constraints){
+            c.reset();
+            c.record();
+          }
+      }
+    }
+
+    return { fval, info, n_eval, n_grad, n_cg };
+  }
+
+  /***
+   optimizes the partially separable function accounting for constraints.
+
+   @param multipliers staring values for the multipliers. There needs to be the
+   same number of multipliers as the number of constraints.
+   @param penalty_start starting value for the penalty parameter.
+   @param max_it_outer maximum number of augmented Lagrangian steps.
+   @param violations_norm_thresh threshold for the norm of the constraint
+   violations.
+   @param tau multiplier used for the penalty parameter between each outer
+   iterations.
+   @param gr_tol convergence tolerance for the Euclidean norm of the gradient. A negative
+   value yields no check.
+
+   The remaining parameters are like optim. Notice that the value of the
+   output is with the additional terms from the augmented Lagrangian function.
+   */
+  optim_info_aug_Lagrang optim_aug_Lagrang
+    (double * val, double * multipliers, double const penalty_start,
+     double const rel_eps, psqn_uint const max_it,
+     psqn_uint const max_it_outer, double const violations_norm_thresh,
+     double const c1, double const c2, double const tau = 1.5,
+     bool const use_bfgs = true, int const trace = 0,
+     double const cg_tol = .5, bool const strong_wolfe = true,
+     psqn_uint const max_cg = 0,
+     precondition const pre_method = precondition::diag,
+     double const gr_tol = -1){
+    // checks
+    if(tau < 1)
+      throw std::invalid_argument("tau < 1");
+    if(penalty_start <= 0)
+      throw std::invalid_argument("penalty_start <= 0");
+
+    // setup
+    penalty = penalty_start;
+    lagrang_mult = multipliers;
+    alloc_n_set_constraint_mem();
+    sum_violations_sq = std::numeric_limits<double>::infinity();
+    reset_counters();
+
+    // resets the use_constraints
+    struct set_flag_false {
+      bool &flag;
+      set_flag_false(bool &flag): flag{flag} { }
+      ~set_flag_false() { flag = false; }
+    } reset_use_constraints{use_constraints};
+    use_constraints = true;
+
+    // perform the minimization
+    optim_info inner_res;
+    psqn_uint n_outer_it{};
+    info_code info{info_code::max_it_reached};
+    for(; n_outer_it < max_it_outer; ++n_outer_it){
+      inner_res = optim(val, rel_eps, max_it, c1, c2, use_bfgs, trace,
+                        cg_tol, strong_wolfe, max_cg, pre_method, gr_tol);
+
+      if(inner_res.info != info_code::converged){
+        info = inner_res.info;
+        break;
+      }
+
+      // check constrains are satisfied
+      if(sqrt(sum_violations_sq) < violations_norm_thresh){
+        info = info_code::converged;
+        break;
+      }
+
+      // update the multipliers
+      for(size_t i = 0; i < constraints.size(); ++i){
+        double const constraint_val{constraints[i](val, false)};
+        lagrang_mult[i] -= penalty * constraint_val;
+      }
+
+      // update the penalty
+      penalty *= tau;
+    }
+
+    constraints_wk_mem_ptr.reset(nullptr); // not needed anymore
+    n_outer_it = std::min(n_outer_it + 1, max_it_outer);
+    return { inner_res.value, info, n_eval, n_grad, n_cg, n_outer_it,
+             penalty };
+  }
+
+  /***
+   sets the masked parameters.
+   @param first, last iterators to the indices.
+   */
+  template<class TIt>
+  void set_masked(TIt first, TIt last){
+    masked_parameters().assign(n_par(), false);
+    any_masked() = std::distance(first, last) > 0;
+
+    for(; first != last; ++first){
+      psqn_uint const idx{static_cast<psqn_uint>(*first)};
+      if(idx >= n_par()){
+        clear_masked(); // undo the changes
+        throw std::runtime_error
+          ("index of the masked parameter is greater than the number of variables");
+      }
+
+      masked_parameters()[idx] = true;
+    }
+  }
+
+  /// clears the masked parameters
+  void clear_masked(){
+    masked_parameters().assign(n_par(), false);
+    any_masked() = false;
+  }
+};
+
+/// type of constraint
+enum constraint_type : char {
+  non_lin_eq = 1
+};
+
+/**
+ base class for the constraints. Uses CRTP but requires, somewhat strangely,
+ that one also inherits from base_worker.
+ */
+template<class Tconstraint>
+class constraint_base {
+  Tconstraint &impl(){
+    return *static_cast<Tconstraint*>(this);
+  }
+
+  Tconstraint const &impl() const {
+    return *static_cast<Tconstraint const*>(this);
+  }
+
+public:
+  /// the type of constraint
+  constraint_type type() const {
+    return impl().type();
+  }
+
+  /// return the number of constraints
+  psqn_uint n_constrained() const {
+    return impl().n_constrained();
+  }
+
+  /// returns a pointer to the zero based indices of the constrainte variables
+  psqn_uint const * indices() const {
+    return impl().indices();
+  }
+
+  /// evaluates the constraint or the gradient of the constraint
+  double operator()(double const * PSQN_RESTRICT par, bool const comp_grad){
+    // copy values
+    psqn_uint const * idx_i{indices()};
+    for(psqn_uint i = 0; i < n_constrained(); ++i, ++idx_i)
+      impl().x_new[i] = par[*idx_i];
+
+    if(!comp_grad)
+      return impl().func(impl().x_new);
+
+    return impl().grad(impl().x_new, impl().gr);
+  }
+};
+
+/***
+ The default constraint class. Does nothing but shows which members function
+ that needs to be implemented and how to inherit from the two required classes.
+ */
+struct default_constraint : public base_worker,
+                            public constraint_base<default_constraint>
+{
+  default_constraint(): base_worker(0) { }
+
+  /// the member functions do not need to be constexpr!
+  static constexpr constraint_type type() {
+    return constraint_type::non_lin_eq;
+  }
+  static constexpr psqn_uint n_constrained() { return 0; }
+  static constexpr psqn_uint const * indices() { return nullptr; }
+  static constexpr double func(double const*) { return 0; }
+  static constexpr double grad(double const*, double *) { return 0; }
 };
 
 /***
  The reporter class can be used to report results during the optimization.
  */
-template<class EFunc, class Reporter = dummy_reporter,
-         class interrupter = dummy_interrupter,
-         class T_caller = default_caller<EFunc> >
-class optimizer {
+template<class EFunc, class TReporter = dummy_reporter,
+         class Tinterrupter = dummy_interrupter,
+         class Tcaller = default_caller<EFunc>,
+         class Tconstraint = default_constraint>
+class optimizer :
+  public base_optimizer
+    <optimizer<EFunc, TReporter, Tinterrupter, Tcaller, Tconstraint>,
+     Tconstraint>
+{
+  using Reporter = TReporter;
+  using interrupter = Tinterrupter;
+
+  using base_opt = base_optimizer<optimizer, Tconstraint>;
+  friend base_opt;
+
   /***
    worker class to hold an element function and the element function's
    Hessian approximation.
    */
-  class worker final : public base_worker {
-  public:
+  struct worker final : public base_worker {
     /// the element function for this worker
     EFunc const func;
     /// indices of first set of private parameters
     psqn_uint const par_start;
+    /**
+     * memory for the Cholesky decomposition for the preconditioning. There
+     * needs to be enough memory for
+     * (func.private_dim() * (func.private_dim() + 1)) / 2
+     */
+    double * const precond_factorization;
 
-    worker(EFunc &&func, double * mem, psqn_uint const par_start):
+    worker(EFunc &&func, double * mem, psqn_uint const par_start,
+           double * precond_factorization):
       base_worker(func.global_dim() + func.private_dim(), mem),
-      func(func), par_start(par_start) {
+      func(func), par_start(par_start),
+      precond_factorization{precond_factorization} {
       reset();
     }
 
@@ -615,7 +1136,7 @@ class optimizer {
     double operator()
       (double const * PSQN_RESTRICT global,
        double const * PSQN_RESTRICT vprivate, bool const comp_grad,
-       T_caller &call_obj){
+       Tcaller &call_obj){
       // copy values
       psqn_uint const d_global  = func.global_dim(),
                       d_private = func.private_dim();
@@ -626,10 +1147,45 @@ class optimizer {
       if(!comp_grad)
         return call_obj.eval_func(func, static_cast<double const *>(x_new));
 
-      double const out = call_obj.eval_grad(
+      return call_obj.eval_grad(
         func, static_cast<double const *>(x_new), gr);
+    }
 
-      return out;
+    /**
+     * sets the precond_factorization using the current Hessian approximation.
+     * The amount of passed working memory has to be equal to
+     * 2 * func.private_dim()^2.
+     */
+    void set_precond_factorization(double *wrk){
+      psqn_uint const d_global {func.global_dim()},
+                      d_private{func.private_dim()};
+
+      // we have to copy the current Hessian approximation
+      double * const A{wrk};
+      wrk += d_private * d_private;
+
+      // copy the part of the Hessian we need
+      {
+        double *a{A};
+        double const *B_shift{B + (d_global * (d_global + 1)) / 2};
+        for(psqn_uint j = 0; j < d_private; ++j,
+            B_shift += j + d_global, a += d_private)
+          lp::copy(a, B_shift + d_global, j + 1);
+      }
+
+      lp::setup_precondition_chol
+        (A, precond_factorization, d_private, wrk);
+    }
+
+    /**
+     * perform the preconditioning on elements
+     * par_start, ..., par_start + func.private_dim() - 1
+     */
+    void apply_precond(double * const res, double const * const rhs){
+      psqn_uint const d_private{func.private_dim()};
+      lp::copy(res + par_start, rhs + par_start, d_private);
+      lp::precondition_chol_solve
+        (precond_factorization, res + par_start, d_private);
     }
   };
 
@@ -641,10 +1197,10 @@ class optimizer {
     double const * g_val;
     psqn_uint const p_dim = w.func.private_dim(),
                     g_dim = w.func.global_dim();
-    T_caller &call_obj;
+    Tcaller &call_obj;
 
   public:
-    sub_problem(worker &w, double const *g_val, T_caller &call_obj):
+    sub_problem(worker &w, double const *g_val, Tcaller &call_obj):
     w(w), g_val(g_val), call_obj(call_obj) { }
 
     psqn_uint size() const {
@@ -662,6 +1218,34 @@ class optimizer {
     }
   };
 
+  std::vector<bool> masked_parameters;
+  bool any_masked{false};
+
+  void update_Hessian_approx(){
+#ifdef _OPENMP
+#pragma omp parallel num_threads(n_threads)
+#endif
+    {
+      double * const tmp_mem_use = get_thread_mem();
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for(psqn_uint i = 0; i < funcs.size(); ++i)
+        funcs[i].update_Hes(tmp_mem_use);
+    }
+  }
+
+  void reset_Hessian_approx(){
+    for(psqn_uint i = 0; i < funcs.size(); ++i){
+      funcs[i].reset();
+      funcs[i].record();
+    }
+  }
+
+  psqn_uint n_print() const {
+    return global_dim;
+  }
+
 public:
   /// dimension of the global parameters
   psqn_uint const global_dim;
@@ -672,31 +1256,35 @@ public:
 
 private:
   /***
-   size of the allocated working memory. The first element is needed for
-   the workers. The second element is needed during the computation for the
-   master thread. The third element is number required per thread.
+   size of the allocated working memory.
+   The first element is needed for the workers.
+   The second element is needed for the preconditioning.
+   The third element is needed during the computation for the master thread.
+   The fourth element is number required per thread.
   */
-  std::array<std::size_t, 3L> const n_mem;
+  std::array<std::size_t, 4L> const n_mem;
   /// maximum number of threads to use
   psqn_uint const max_threads;
   /// working memory
-  std::unique_ptr<double[]> mem =
-    std::unique_ptr<double[]>(
-        new double[n_mem[0] + n_mem[1] + max_threads * n_mem[2]]);
+  std::unique_ptr<double[]> mem
+    {new double[n_mem[0] + n_mem[1] + n_mem[2] + max_threads * n_mem[3]]};
+  /// pointer to memory that is used for the preconditioning
+  double * const precond_mem{mem.get() + n_mem[0]};
   /// pointer to temporary memory to use on the master thread
-  double * const temp_mem = mem.get() + n_mem[0];
+  double * const temp_mem{precond_mem + n_mem[1]};
   /// pointer to temporary memory to be used by the threads
-  double * const temp_thread_mem = temp_mem + n_mem[1];
+  double * const temp_thread_mem{temp_mem + n_mem[2]};
+
   /// element functions
   std::vector<worker> funcs;
   /// object to do computations prior to evaluating the element functions.
-  T_caller caller = T_caller(([&](std::vector<worker> &fs) -> T_caller {
+  Tcaller caller = Tcaller(([&](std::vector<worker> &fs) -> Tcaller {
     std::vector<EFunc const*> ele_funcs;
     size_t n_ele_funcs = fs.size();
     ele_funcs.reserve(n_ele_funcs);
     for(auto &f : fs)
       ele_funcs.emplace_back(&f.func);
-    return T_caller(ele_funcs);
+    return Tcaller(ele_funcs);
   })(funcs));
 
   /// returns the thread number.
@@ -710,7 +1298,7 @@ private:
 
   /// returns working memory for this thread
   double * get_thread_mem(int const thread_num) const noexcept {
-    return temp_thread_mem + thread_num * n_mem[2];
+    return temp_thread_mem + thread_num * n_mem[3];
   }
 
   double * get_thread_mem() const noexcept {
@@ -720,24 +1308,20 @@ private:
   /// number of threads to use
   int n_threads = 1L;
 
-  // inner optimizer to use
-  std::unique_ptr<optimizer_internals<optimizer, Reporter> > opt_internals;
-  friend class optimizer_internals<optimizer, Reporter>;
-
-  // function need for optimizer_internals to get temporary memory
+  /// function need for base_optimizer to get temporary memory
   double * get_internals_mem() {
     // need memory for B_start!
     return temp_mem + (global_dim * (global_dim + 1)) / 2;
   }
 
-  // class to compute B.x for optimizer_internals
+  /// class to compute B.x for base_optimizer
   class comp_B_vec_obj {
     bool is_first_call = true;
     double * B_start;
-    optimizer<EFunc, Reporter, interrupter, T_caller> &obj;
+    optimizer &obj;
   public:
-    comp_B_vec_obj(double * mem,
-                   optimizer<EFunc, Reporter, interrupter, T_caller> &obj):
+    comp_B_vec_obj
+    (double * mem, optimizer &obj):
     B_start(mem), obj(obj) { }
 
 
@@ -748,8 +1332,104 @@ private:
     }
   };
 
-  inline comp_B_vec_obj get_comp_B_vec() {
+  comp_B_vec_obj get_comp_B_vec() {
     return comp_B_vec_obj(temp_mem, *this);
+  }
+
+  /// aggregates the current hessian approximation for the global parameters
+  void aggregate_global_hess_aprx
+    (double * const PSQN_RESTRICT B_start) const noexcept {
+    psqn_uint const B_sub_ele = (global_dim * (global_dim + 1)) / 2;
+
+    // initialize the thread memory
+    for(int t = 0; t < n_threads; ++t)
+      std::fill(get_thread_mem(t), get_thread_mem(t) + B_sub_ele, 0);
+
+    psqn_uint const n_funcs{static_cast<psqn_uint>(funcs.size())};
+#ifdef _OPENMP
+#pragma omp parallel num_threads(n_threads)
+#endif
+    {
+      double * wk_mem{get_thread_mem()};
+#ifdef _OPENMP
+#pragma omp for
+#endif
+      for(psqn_uint i = 0; i < n_funcs; ++i){
+        auto &f = funcs[i];
+        double * PSQN_RESTRICT  b{wk_mem};
+        double const *b_inc{f.B};
+        for(psqn_uint j = 0; j < B_sub_ele; ++j)
+          *b++ += *b_inc++;
+      }
+    }
+
+    // aggregate the result
+    std::fill(B_start, B_start + B_sub_ele, 0);
+    for(int t = 0; t < n_threads; ++t){
+      double * PSQN_RESTRICT  b{B_start};
+      double const *b_inc{get_thread_mem(t)};
+      for(psqn_uint j = 0; j < B_sub_ele; ++j)
+        *b++ += *b_inc++;
+    }
+  }
+
+  void setup_custom_preconditioning(){
+#ifdef PSQN_W_LAPACK
+    // handle the global parameters
+    aggregate_global_hess_aprx(precond_mem);
+    {
+      double * const A{get_thread_mem()};
+      double * const wk_mem{A + global_dim * global_dim};
+      double const *hess{precond_mem};
+      double *a{A};
+      for(psqn_uint j = 0; j < global_dim; ++j, hess += j, a += global_dim)
+        lp::copy(a, hess, j + 1);
+
+      lp::setup_precondition_chol(A, precond_mem, global_dim, wk_mem);
+    }
+
+    // handle the private parameters
+    psqn_uint const n_funcs{static_cast<psqn_uint>(funcs.size())};
+#ifdef _OPENMP
+#pragma omp parallel num_threads(n_threads)
+#endif
+    {
+      double * r_mem{get_thread_mem()};
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for(psqn_uint i = 0; i < n_funcs; ++i)
+        funcs[i].set_precond_factorization(r_mem);
+    }
+
+#else // #ifdef PSQN_W_LAPACK
+    throw std::runtime_error("not build with LAPACK");
+#endif
+  }
+
+  /***
+   * applies the custom preconditioning. setup_custom_preconditioning must be
+   * called before
+   */
+  void custom_preconditioning
+    (double * const res, double const * const rhs){
+#ifdef PSQN_W_LAPACK
+    // handle the global parameters
+    lp::copy(res, rhs, global_dim);
+    lp::precondition_chol_solve(precond_mem, res, global_dim);
+
+    // handle the private parameters
+    psqn_uint const n_funcs{static_cast<psqn_uint>(funcs.size())};
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(n_threads)
+#endif
+    for(psqn_uint i = 0; i < n_funcs; ++i)
+      funcs[i].apply_precond(res, rhs);
+
+#else // #ifdef PSQN_W_LAPACK
+    throw std::runtime_error("not build with LAPACK");
+#endif
   }
 
 public:
@@ -783,9 +1463,10 @@ public:
       out += f.private_dim();
     return out;
   })()),
-  n_mem(([&]() -> std::array<std::size_t, 3L> {
-    std::size_t out(0L),
-           max_priv(0L);
+  n_mem(([&]() -> std::array<std::size_t, 4L> {
+    std::size_t worker_mem{},
+               precond_mem{},
+                  max_priv{};
     for(auto &f : funcs_in){
       if(f.global_dim() != global_dim)
         throw std::invalid_argument(
@@ -798,22 +1479,26 @@ public:
       if(max_priv < private_dim)
         max_priv = private_dim;
 
-      out += n_ele * 4L + (n_ele * (n_ele + 1L)) / 2L;
+      worker_mem += worker::n_perm_mem(n_ele);
+      precond_mem += (private_dim * (private_dim + 1)) / 2;
     }
 
-    constexpr std::size_t const mult = cacheline_size() / sizeof(double),
-                            min_size = 2L * mult;
+    constexpr std::size_t mult{cacheline_size() / sizeof(double)},
+                      min_size{2L * mult};
 
-    std::size_t thread_mem = std::max<std::size_t>(
-      3L * (global_dim + max_priv), min_size);
+    precond_mem += (global_dim * (global_dim + 1)) / 2;
+
+    std::size_t thread_mem = std::max
+      (worker::n_temp_mem(global_dim + max_priv), min_size);
+    thread_mem = std::max(thread_mem, 2 * max_priv * max_priv);
+    thread_mem = std::max<size_t>(thread_mem, 2 * global_dim * global_dim);
     thread_mem = (thread_mem + mult - 1L) / mult;
     thread_mem *= mult;
 
     std::size_t master_mem(5L * n_par);
     master_mem += (global_dim * (global_dim + 1L)) / 2L;
 
-    std::array<std::size_t, 3L> ret {out, master_mem, thread_mem };
-    return ret;
+    return {worker_mem, precond_mem, master_mem, thread_mem };
   })()),
   max_threads(max_threads > 0 ? max_threads : 1L),
   funcs(([&]() -> std::vector<worker> {
@@ -821,19 +1506,20 @@ public:
     psqn_uint const n_ele(funcs_in.size());
     out.reserve(funcs_in.size());
 
-    double * mem_ptr = mem.get();
+    double * mem_ptr{mem.get()};
+    double * pre_mem{precond_mem + (global_dim * (global_dim + 1)) / 2};
     psqn_uint i_start(global_dim);
     for(psqn_uint i = 0; i < n_ele; ++i){
-      out.emplace_back(std::move(funcs_in[i]), mem_ptr, i_start);
+      out.emplace_back(std::move(funcs_in[i]), mem_ptr, i_start, pre_mem);
       psqn_uint const n_ele = out.back().n_ele;
       mem_ptr += n_ele * 4L + (n_ele * (n_ele + 1L)) / 2L;
-      i_start += out.back().func.private_dim();
+      psqn_uint const priv_dim{out.back().func.private_dim()};
+      i_start += priv_dim;
+      pre_mem += (priv_dim * (priv_dim + 1)) / 2;
     }
 
     return out;
-  })()) {
-    opt_internals.reset(new optimizer_internals<optimizer, Reporter>(this));
-  }
+  })()) { }
 
   /***
    evaluates the partially separable function and also the gradient if
@@ -852,6 +1538,15 @@ public:
       for(psqn_uint i = 0; i < n_funcs; ++i){
         auto &f = funcs[i];
         out += f(val, val + f.par_start, comp_grad, caller);
+
+        if(any_masked && comp_grad){
+          for(psqn_uint j = 0; j < global_dim; ++j)
+            if(masked_parameters[j])
+              f.gr[j] = 0;
+          for(psqn_uint j = 0; j < f.func.private_dim(); ++j)
+            if(masked_parameters[j + f.par_start])
+              f.gr[j + global_dim] = 0;
+        }
       }
 
       if(comp_grad){
@@ -873,14 +1568,19 @@ public:
       return serial_version();
 
 #ifdef _OPENMP
+    if(comp_grad)
+      // there is no guarantee that each thread runs
+      for(int t = 0; t < n_threads; t++){
+        double *r_mem{get_thread_mem(t)};
+        std::fill(r_mem, r_mem + global_dim + 1, 0);
+      }
+
 #pragma omp parallel num_threads(n_threads)
     {
     double * r_mem = get_thread_mem(),
            * v_mem =
-               r_mem + global_dim + 1L /* leave 1 ele for func value*/;
+               r_mem + global_dim + 1L /* leave 1 ele for func value */;
     lp::copy(v_mem, val, global_dim);
-    if(comp_grad)
-      std::fill(r_mem, r_mem + global_dim, 0.);
 
     double &thread_terms = *(r_mem + global_dim);
     thread_terms = 0;
@@ -888,6 +1588,15 @@ public:
     for(psqn_uint i = 0; i < n_funcs; ++i){
       auto &f = funcs[i];
       thread_terms += f(v_mem, val + f.par_start, comp_grad, caller);
+
+      if(any_masked && comp_grad){
+        for(psqn_uint j = 0; j < global_dim; ++j)
+          if(masked_parameters[j])
+            f.gr[j] = 0;
+        for(psqn_uint j = 0; j < f.func.private_dim(); ++j)
+          if(masked_parameters[j + f.par_start])
+            f.gr[j + global_dim] = 0;
+      }
 
       if(comp_grad){
         // update global
@@ -907,7 +1616,7 @@ public:
 
     // add to global parameters
     double out(0.);
-    for (int t = 0; t < n_threads; t++){
+    for(int t = 0; t < n_threads; t++){
       double const *r_mem = get_thread_mem(t);
       if(comp_grad)
         for(psqn_uint i = 0; i < global_dim; ++i)
@@ -935,17 +1644,8 @@ public:
     psqn_uint const n_funcs = funcs.size();
 
     // aggregate the first part of B if needed
-    if(comp_B_start){
-      psqn_uint const B_sub_ele = (global_dim * (global_dim + 1)) / 2;
-      std::fill(B_start, B_start + B_sub_ele, 0);
-      for(psqn_uint i = 0; i < n_funcs; ++i){
-        auto &f = funcs[i];
-        double * b = B_start;
-        double const *b_inc = f.B;
-        for(psqn_uint j = 0; j < B_sub_ele; ++j)
-          *b++ += *b_inc++;
-      }
-    }
+    if(comp_B_start)
+      aggregate_global_hess_aprx(B_start);
 
     // compute the first part
     lp::mat_vec_dot(B_start, val, res, global_dim);
@@ -969,12 +1669,17 @@ public:
     }
 
 #ifdef _OPENMP
+    for(int t = 0; t < n_threads; t++){
+      // there is no guarantee that each thread runs
+      double * r_mem{get_thread_mem(t)};
+      std::fill(r_mem, r_mem + global_dim, 0.);
+    }
+
 #pragma omp parallel num_threads(n_threads)
     {
     double * r_mem = get_thread_mem(),
            * v_mem = r_mem + global_dim;
     lp::copy(v_mem, val, global_dim);
-    std::fill(r_mem, r_mem + global_dim, 0.);
 
 #pragma omp for schedule(static)
     for(psqn_uint i = 0; i < n_funcs; ++i){
@@ -1019,150 +1724,6 @@ public:
       for(; j < iprivate + global_dim; ++j, b_diag += j + 1)
         *x_priv++ = *b_diag;
     }
-  }
-
-  /***
-    conjugate gradient method with diagonal preconditioning. Solves B.y = x
-    where B is the Hessian approximation.
-    @param tol convergence threshold.
-    @param max_cg maximum number of conjugate gradient iterations.
-    @param trace controls the amount of tracing information.
-    @param pre_method preconditioning method.
-   */
-  bool conj_grad(double const * PSQN_RESTRICT x, double * PSQN_RESTRICT y,
-                 double const tol, psqn_uint const max_cg,
-                 int const trace, precondition const pre_method){
-    return opt_internals->conj_grad(x, y, tol, max_cg, trace, pre_method);
-  }
-
-  /***
-   performs line search to satisfy the Wolfe condition.
-   @param f0 value of the functions at the current value.
-   @param x0 value the function is evaluated.
-   @param gr0 value of the current gradient.
-   @param dir direction to search in.
-   @param fnew the function value at the found solution.
-   @param c1,c2 thresholds for Wolfe condition.
-   @param strong_wolfe true if the strong Wolfe condition should be used.
-   @param trace controls the amount of tracing information.
-
-   x0 and gr0 contains the new value and gradient on return. The method
-   returns false if the line search fails.
-   */
-  bool line_search(
-      double const f0, double * PSQN_RESTRICT x0, double * PSQN_RESTRICT gr0,
-      double * PSQN_RESTRICT dir, double &fnew, double const c1,
-      double const c2, bool const strong_wolfe, int const trace){
-    return opt_internals->line_search(f0, x0, gr0, dir, fnew, c1, c2,
-                                      strong_wolfe, trace);
-  }
-
-  /***
-   optimizes the partially separable function.
-   @param val pointer to starting value. Set to the final estimate at the
-   end.
-   @param rel_eps relative convergence threshold.
-   @param max_it maximum number of iterations.
-   @param c1,c2 thresholds for Wolfe condition.
-   @param use_bfgs bool for whether to use BFGS updates or SR1 updates.
-   @param trace integer with info level passed to reporter.
-   @param cg_tol threshold for conjugate gradient method.
-   @param strong_wolfe true if the strong Wolfe condition should be used.
-   @param max_cg maximum number of conjugate gradient iterations in each
-   iteration. Use zero if there should not be a limit.
-   @param pre_method preconditioning method.
-   */
-  optim_info optim
-    (double * val, double const rel_eps, psqn_uint const max_it,
-     double const c1, double const c2,
-     bool const use_bfgs = true, int const trace = 0,
-     double const cg_tol = .5, bool const strong_wolfe = true,
-     psqn_uint const max_cg = 0,
-     precondition const pre_method = precondition::diag){
-    opt_internals->reset_counters();
-    for(auto &f : funcs){
-      f.reset();
-      f.use_bfgs = use_bfgs;
-    }
-
-    std::unique_ptr<double[]> gr(new double[n_par]),
-                             dir(new double[n_par]);
-
-    // evaluate the gradient at the current value
-    double fval = eval(val, gr.get(), true);
-    for(auto &f : funcs)
-      f.record();
-
-    info_code info = info_code::max_it_reached;
-    int n_line_search_fail = 0;
-    for(psqn_uint i = 0; i < max_it; ++i){
-      if(i % 10 == 0)
-        if(interrupter::check_interrupt()){
-          info = info_code::user_interrupt;
-          break;
-        }
-
-      double const fval_old = fval;
-      if(!conj_grad(gr.get(), dir.get(), cg_tol,
-                    max_cg < 1 ? n_par : max_cg, trace,
-                    pre_method)){
-        info = info_code::conjugate_gradient_failed;
-        Reporter::cg(trace, i, opt_internals->n_cg, false);
-        break;
-      } else
-        Reporter::cg(trace, i, opt_internals->n_cg, true);
-
-      for(double * d = dir.get(); d != dir.get() + n_par; ++d)
-        *d *= -1;
-
-      double const x1 = *val;
-      if(!line_search(fval_old, val, gr.get(), dir.get(), fval, c1, c2,
-                      strong_wolfe, trace)){
-        info = info_code::line_search_failed;
-        Reporter::line_search
-          (trace, i, opt_internals->n_eval, opt_internals->n_grad, fval_old,
-           fval, false, std::numeric_limits<double>::quiet_NaN(),
-           const_cast<double const *>(val), global_dim);
-        if(++n_line_search_fail > 2)
-          break;
-      } else{
-        n_line_search_fail = 0;
-        Reporter::line_search
-          (trace, i, opt_internals->n_eval, opt_internals->n_grad, fval_old, fval,
-           true, (*val - x1) / *dir.get(), const_cast<double const *>(val),
-           global_dim);
-
-      }
-
-      bool const has_converged =
-        abs(fval - fval_old) < rel_eps * (abs(fval_old) + rel_eps);
-      if(has_converged){
-        info = info_code::converged;
-        break;
-      }
-
-      // update the Hessian and take another iteration
-      if(n_line_search_fail < 1){
-#ifdef _OPENMP
-#pragma omp parallel num_threads(n_threads)
-#endif
-        {
-          double * const tmp_mem_use = get_thread_mem();
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-          for(psqn_uint i = 0; i < funcs.size(); ++i)
-            funcs[i].update_Hes(tmp_mem_use);
-        }
-      } else
-        for(psqn_uint i = 0; i < funcs.size(); ++i){
-          funcs[i].reset();
-          funcs[i].record();
-        }
-    }
-
-    return { fval, info, opt_internals->n_eval, opt_internals->n_grad,
-             opt_internals->n_cg };
   }
 
   /***
@@ -1216,14 +1777,16 @@ public:
    @param rel_eps relative convergence threshold.
    @param max_it maximum number of iterations.
    @param c1,c2 thresholds for Wolfe condition.
+   @param gr_tol convergence tolerance for the Euclidean norm of the gradient. A negative
+   value yields no check.
 
-   If you supply a non-default T_caller class, T_caller.setup is only called
+   If you supply a non-default Tcaller class, Tcaller.setup is only called
    on the starting values. Thus, this function only yields valid results if
    this is what is expected.
    */
   double optim_priv
   (double * val, double const rel_eps, psqn_uint const max_it,
-   double const c1, double const c2){
+   double const c1, double const c2, double const gr_tol = -1){
     double out(0.);
     caller.setup(val, true);
 
@@ -1235,7 +1798,8 @@ public:
       sub_problem prob(f, val, caller);
       double * const p_val = val + f.par_start;
 
-      auto const opt_out = bfgs(prob, p_val, rel_eps, max_it, c1, c2, 0L);
+      auto const opt_out =
+        bfgs(prob, p_val, rel_eps, max_it, c1, c2, 0L, gr_tol);
       out += opt_out.value;
     }
 
@@ -1265,7 +1829,7 @@ private:
   std::vector<Eigen::Triplet<double> > sparse_B_mat_triplets;
 
   /// fills the sparse_B_mat
-  inline void fill_sparse_B_mat(){
+  void fill_sparse_B_mat(){
     // fill in the triplets
     sparse_B_mat_triplets.clear();
 
@@ -1339,8 +1903,73 @@ public:
     fill_sparse_B_mat();
     return sparse_B_mat;
   }
+
+  /***
+   returns the true Hessian as a sparse matrix.
+
+   @param val where to evaluate the function at
+   @param eps determines the step size given by max(eps, |x| * eps)
+   @param scale scaling factor in the Richardson extrapolation
+   @param tol relative convergence criteria given by max(tol, |f| * tol)
+   @param order maximum number of iteration of the Richardson extrapolation
+   */
+  Eigen::SparseMatrix<double> true_hess_sparse
+    (double const *val, double const eps = 1e-4, double const scale = 2,
+     double const tol = 1e-8, unsigned const order = 6){
+    // setup
+    std::vector<double> val_cp(n_par);
+    std::copy(val, val + n_par, val_cp.begin());
+    std::vector<double> wk_mem;
+
+    // compute the Hessian
+    for(auto &f : funcs){
+      psqn_uint const private_dim{f.func.private_dim()},
+                           n_vars{global_dim + private_dim},
+                   private_offset{f.par_start};
+
+      auto get_idx = [&](unsigned const i){
+        return i >= global_dim  ? i - global_dim + private_offset : i;
+      };
+
+      // compute the approximation of the worker's Hessian
+      {
+        double *h{f.B};
+        for(psqn_uint i = 0; i < n_vars; ++i, h += i){
+          auto deriv_functor = [&](double const x, double *gr){
+            psqn_uint const idx{get_idx(i)};
+            double const old_val{val_cp[idx]};
+            val_cp[idx] = x;
+
+            // unfortunately we have to call this every time
+            caller.setup(val_cp.data(), true);
+            f(val_cp.data(), val_cp.data() + private_offset, true, caller);
+
+            std::copy(f.gr, f.gr + i + 1, gr);
+            val_cp[idx] = old_val;
+          };
+
+          using comp_obj = richardson_extrapolation<decltype(deriv_functor)>;
+          unsigned const n_wk_mem{comp_obj::n_wk_mem(n_vars, order)};
+          wk_mem.resize(n_wk_mem);
+
+          comp_obj
+            (deriv_functor, order, wk_mem.data(), eps, scale, tol, i + 1)
+            (val_cp[get_idx(i)], h);
+        }
+      }
+    }
+
+    fill_sparse_B_mat();
+    return sparse_B_mat;
+  }
+
 #else
   void get_hess_sparse() {
+    throw_no_eigen_error();
+  }
+
+  void true_hess_sparse(double const*, double const, double const,
+                        double const, unsigned const){
     throw_no_eigen_error();
   }
 #endif // PSQN_USE_EIGEN
@@ -1383,10 +2012,22 @@ public:
  similar to optimizer but for generic partially separable functions. This has
  some extra overhead.
  */
-template<class EFunc, class Reporter = dummy_reporter,
-         class interrupter = dummy_interrupter,
-         class T_caller = default_caller<EFunc> >
-class optimizer_generic {
+template<class EFunc, class TReporter = dummy_reporter,
+         class Tinterrupter = dummy_interrupter,
+         class Tcaller = default_caller<EFunc>,
+         class Tconstraint = default_constraint >
+class optimizer_generic :
+  public base_optimizer
+  <optimizer_generic<EFunc, TReporter, Tinterrupter, Tcaller, Tconstraint>,
+   Tconstraint>
+{
+  using Reporter = TReporter;
+  using interrupter = Tinterrupter;
+  using constraint = Tconstraint;
+
+  using base_opt = base_optimizer<optimizer_generic, Tconstraint>;
+  friend base_opt;
+
   /***
    worker class to hold an element function and the element function's
    Hessian approximation.
@@ -1419,21 +2060,49 @@ class optimizer_generic {
      */
     double operator()
       (double const * PSQN_RESTRICT point, bool const comp_grad,
-       T_caller &call_obj){
+       Tcaller &call_obj){
       // copy values
       psqn_uint const * idx_i = indices();
       for(psqn_uint i = 0; i < n_args; ++i, ++idx_i)
         x_new[i] = point[*idx_i];
 
       if(!comp_grad)
-        return call_obj.eval_func(func, static_cast<double const *>(x_new));
+        return call_obj.eval_func(func, const_cast<double const *>(x_new));
 
       double const out = call_obj.eval_grad(
-        func, static_cast<double const *>(x_new), gr);
+        func, const_cast<double const *>(x_new), gr);
 
       return out;
     }
   };
+
+  std::vector<bool> masked_parameters;
+  bool any_masked{false};
+
+  void update_Hessian_approx(){
+#ifdef _OPENMP
+#pragma omp parallel num_threads(n_threads)
+#endif
+    {
+      double * const tmp_mem_use = get_thread_mem();
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for(psqn_uint i = 0; i < funcs.size(); ++i)
+        funcs[i].update_Hes(tmp_mem_use);
+    }
+  }
+
+  void reset_Hessian_approx(){
+    for(psqn_uint i = 0; i < funcs.size(); ++i){
+      funcs[i].reset();
+      funcs[i].record();
+    }
+  }
+
+  psqn_uint n_print() const {
+    return 0;
+  }
 
 public:
   /// true if the element functions are thread-safe
@@ -1458,15 +2127,17 @@ private:
   double * const temp_mem = mem.get() + n_mem[0];
   /// pointer to temporary memory to be used by the threads
   double * const temp_thread_mem = temp_mem + n_mem[1];
+
   /// element functions
   std::vector<worker> funcs;
+
   /// object to do computations prior to evaluating the element functions.
-  T_caller caller = T_caller(([&](std::vector<worker> &fs) -> T_caller {
+  Tcaller caller = Tcaller(([&](std::vector<worker> &fs) -> Tcaller {
     std::vector<EFunc const*> ele_funcs;
     ele_funcs.reserve(fs.size());
     for(auto &f : fs)
       ele_funcs.emplace_back(&f.func);
-    return T_caller(ele_funcs);
+    return Tcaller(ele_funcs);
   })(funcs));
 
   /// returns the thread number.
@@ -1490,22 +2161,16 @@ private:
   /// number of threads to use
   int n_threads = 1L;
 
-  // inner optimizer to use
-  std::unique_ptr<optimizer_internals<optimizer_generic, Reporter> >
-    opt_internals;
-  friend class optimizer_internals<optimizer_generic, Reporter>;
-
-  // function need for optimizer_internals to get temporary memory
+  // function need for base_optimizer to get temporary memory
   double * get_internals_mem() {
     return temp_mem;
   }
 
-  // class to compute B.x for optimizer_internals
+  // class to compute B.x for base_optimizer
   class comp_B_vec_obj {
-    optimizer_generic<EFunc, Reporter, interrupter, T_caller> &obj;
+    optimizer_generic &obj;
   public:
-    comp_B_vec_obj
-    (optimizer_generic<EFunc, Reporter, interrupter, T_caller> &obj):
+    comp_B_vec_obj(optimizer_generic &obj):
     obj(obj) { }
 
     void operator()(double const * const PSQN_RESTRICT val,
@@ -1514,7 +2179,7 @@ private:
     }
   };
 
-  inline comp_B_vec_obj get_comp_B_vec() {
+  comp_B_vec_obj get_comp_B_vec() {
     return comp_B_vec_obj(*this);
   }
 
@@ -1558,16 +2223,16 @@ public:
       if(max_args < n_args)
         max_args = n_args;
 
-      out += n_args * 4L + (n_args * (n_args + 1L)) / 2L;
+      out += worker::n_perm_mem(n_args);
     }
 
-    constexpr std::size_t const mult = cacheline_size() / sizeof(double),
+    constexpr std::size_t mult = cacheline_size() / sizeof(double),
                             min_size = 2L * mult;
     std::size_t const n_extra = std::min<std::size_t>(2L, max_args);
 
     std::size_t thread_mem = std::max<std::size_t>(
       2L * n_par + n_extra, min_size);
-    thread_mem = std::max<std::size_t>(thread_mem, 3L * max_args);
+    thread_mem = std::max(thread_mem, worker::n_temp_mem(max_args));
     thread_mem = (thread_mem + mult - 1L) / mult;
     thread_mem *= mult;
 
@@ -1590,10 +2255,7 @@ public:
     }
 
     return out;
-  })()) {
-    opt_internals.reset(
-      new optimizer_internals<optimizer_generic, Reporter>(this));
-  }
+  })()) { }
 
   /***
    evaluates the partially separable function and also the gradient if
@@ -1612,6 +2274,13 @@ public:
       for(psqn_uint i = 0; i < n_funcs; ++i){
         auto &f = funcs[i];
         lp::Kahan(out, out_comp, f(val, comp_grad, caller));
+
+        if(any_masked && comp_grad){
+          psqn_uint const * idx_j = f.indices();
+          for(psqn_uint j = 0; j < f.n_args; ++j, ++idx_j)
+            if(masked_parameters[*idx_j])
+              f.gr[j] = 0;
+        }
       }
 
       if(comp_grad){
@@ -1650,6 +2319,13 @@ public:
       lp::Kahan(th_out, th_comp, f(val, comp_grad, caller));
 
       if(comp_grad){
+        if(any_masked){
+          psqn_uint const * idx_j = f.indices();
+          for(psqn_uint j = 0; j < f.n_args; ++j, ++idx_j)
+            if(masked_parameters[*idx_j])
+              f.gr[j] = 0;
+        }
+
         // add the gradient terms
         psqn_uint const * idx_j = f.indices();
         for(psqn_uint j = 0; j < f.n_args; ++j, ++idx_j)
@@ -1785,149 +2461,6 @@ public:
     }
   }
 
-  /***
-    conjugate gradient method with diagonal preconditioning. Solves B.y = x
-    where B is the Hessian approximation.
-    @param tol convergence threshold.
-    @param max_cg maximum number of conjugate gradient iterations.
-    @param trace controls the amount of tracing information.
-    @param pre_method preconditioning method.
-   */
-  bool conj_grad(double const * PSQN_RESTRICT x, double * PSQN_RESTRICT y,
-                 double const tol, psqn_uint const max_cg,
-                 int const trace, precondition const pre_method){
-    return opt_internals->conj_grad(x, y, tol, max_cg, trace, pre_method);
-  }
-
-  /***
-   performs line search to satisfy the Wolfe condition.
-   @param f0 value of the functions at the current value.
-   @param x0 value the function is evaluated.
-   @param gr0 value of the current gradient.
-   @param dir direction to search in.
-   @param fnew the function value at the found solution.
-   @param c1,c2 thresholds for Wolfe condition.
-   @param strong_wolfe true if the strong Wolfe condition should be used.
-   @param trace controls the amount of tracing information.
-
-   x0 and gr0 contains the new value and gradient on return. The method
-   returns false if the line search fails.
-   */
-  bool line_search(
-      double const f0, double * PSQN_RESTRICT x0, double * PSQN_RESTRICT gr0,
-      double * PSQN_RESTRICT dir, double &fnew, double const c1,
-      double const c2, bool const strong_wolfe, int const trace){
-    return opt_internals->line_search(f0, x0, gr0, dir, fnew, c1, c2,
-                                      strong_wolfe, trace);
-  }
-
-  /***
-   optimizes the partially separable function.
-   @param val pointer to starting value. Set to the final estimate at the
-   end.
-   @param rel_eps relative convergence threshold.
-   @param max_it maximum number of iterations.
-   @param c1,c2 thresholds for Wolfe condition.
-   @param use_bfgs bool for whether to use BFGS updates or SR1 updates.
-   @param trace integer with info level passed to reporter.
-   @param cg_tol threshold for conjugate gradient method.
-   @param strong_wolfe true if the strong Wolfe condition should be used.
-   @param max_cg maximum number of conjugate gradient iterations in each
-   iteration. Use zero if there should not be a limit.
-   @param pre_method preconditioning method.
-   */
-  optim_info optim
-    (double * val, double const rel_eps, psqn_uint const max_it,
-     double const c1, double const c2,
-     bool const use_bfgs = true, int const trace = 0,
-     double const cg_tol = .5, bool const strong_wolfe = true,
-     psqn_uint const max_cg = 0,
-     precondition const pre_method = precondition::diag){
-    opt_internals->reset_counters();
-    for(auto &f : funcs){
-      f.reset();
-      f.use_bfgs = use_bfgs;
-    }
-
-    std::unique_ptr<double[]> gr(new double[n_par]),
-                             dir(new double[n_par]);
-
-    // evaluate the gradient at the current value
-    double fval = eval(val, gr.get(), true);
-    for(auto &f : funcs)
-      f.record();
-
-    info_code info = info_code::max_it_reached;
-    int n_line_search_fail = 0;
-    for(psqn_uint i = 0; i < max_it; ++i){
-      if(i % 10 == 0)
-        if(interrupter::check_interrupt()){
-          info = info_code::user_interrupt;
-          break;
-        }
-
-      double const fval_old = fval;
-      if(!conj_grad(gr.get(), dir.get(), cg_tol,
-                    max_cg < 1 ? n_par : max_cg, trace,
-                    pre_method)){
-        info = info_code::conjugate_gradient_failed;
-        Reporter::cg(trace, i, opt_internals->n_cg, false);
-        break;
-      } else
-        Reporter::cg(trace, i, opt_internals->n_cg, true);
-
-      for(double * d = dir.get(); d != dir.get() + n_par; ++d)
-        *d *= -1;
-
-      double const x1 = *val;
-      if(!line_search(fval_old, val, gr.get(), dir.get(), fval, c1, c2,
-                      strong_wolfe, trace)){
-        info = info_code::line_search_failed;
-        Reporter::line_search
-          (trace, i, opt_internals->n_eval, opt_internals->n_grad, fval_old,
-           fval, false, std::numeric_limits<double>::quiet_NaN(),
-           const_cast<double const *>(val), 0L);
-        if(++n_line_search_fail > 2)
-          break;
-      } else{
-        n_line_search_fail = 0;
-        Reporter::line_search
-          (trace, i, opt_internals->n_eval, opt_internals->n_grad, fval_old, fval,
-           true, (*val - x1) / *dir.get(), const_cast<double const *>(val), 0L);
-
-      }
-
-      bool const has_converged =
-        abs(fval - fval_old) < rel_eps * (abs(fval_old) + rel_eps);
-      if(has_converged){
-        info = info_code::converged;
-        break;
-      }
-
-      // update the Hessian and take another iteration
-      if(n_line_search_fail < 1){
-#ifdef _OPENMP
-#pragma omp parallel num_threads(n_threads)
-#endif
-        {
-          double * const tmp_mem_use = get_thread_mem();
-#ifdef _OPENMP
-#pragma omp for schedule(static)
-#endif
-          for(psqn_uint i = 0; i < funcs.size(); ++i)
-            funcs[i].update_Hes(tmp_mem_use);
-        }
-      } else
-        for(psqn_uint i = 0; i < funcs.size(); ++i){
-          funcs[i].reset();
-          funcs[i].record();
-        }
-    }
-
-    return { fval, info, opt_internals->n_eval, opt_internals->n_grad,
-             opt_internals->n_cg };
-  }
-
   /**
    returns a pointers to the element function objects. This may be useful if
    the element functions hold data.
@@ -1972,7 +2505,7 @@ private:
   std::vector<Eigen::Triplet<double> > sparse_B_mat_triplets;
 
   /// fills the sparse_B_mat
-  inline void fill_sparse_B_mat(){
+  void fill_sparse_B_mat(){
     // fill in the triplets
     sparse_B_mat_triplets.clear();
 
@@ -1981,12 +2514,14 @@ private:
       psqn_uint const n_args = f.n_args;
       double const * B = f.B;
       psqn_uint const * const idx = f.indices();
-      for(psqn_uint j = 0; j < n_args; ++j)
-        for(psqn_uint i = 0; i <= j; ++i){
-          if(i < j)
-            sparse_B_mat_triplets.emplace_back(idx[i], idx[j], *B   );
-          sparse_B_mat_triplets  .emplace_back(idx[j], idx[i], *B++);
+      for(psqn_uint j = 0; j < n_args; ++j){
+        for(psqn_uint i = 0; i < j; ++i){
+          sparse_B_mat_triplets.emplace_back(idx[i], idx[j], *B   );
+          sparse_B_mat_triplets.emplace_back(idx[j], idx[i], *B++);
         }
+
+        sparse_B_mat_triplets.emplace_back(idx[j], idx[j], *B++);
+      }
     }
 
     sparse_B_mat.resize(n_par, n_par);
@@ -2001,6 +2536,15 @@ private:
 
 #endif // PSQN_USE_EIGEN
 
+  void setup_custom_preconditioning(){
+    throw std::runtime_error("there is no custom preconditioner");
+  }
+
+  void custom_preconditioning(double * const PSQN_RESTRICT res,
+                              double const * const rhs){
+    throw std::runtime_error("there is no custom preconditioner");
+  }
+
 public:
   /***
    returns the current Hessian approximation as sparse matrix.
@@ -2010,6 +2554,58 @@ public:
     fill_sparse_B_mat();
     return sparse_B_mat;
   }
+
+  /***
+   returns the true Hessian as a sparse matrix.
+
+   @param val where to evaluate the function at
+   @param eps determines the step size given by max(eps, |x| * eps)
+   @param scale scaling factor in the Richardson extrapolation
+   @param tol relative convergence criteria given by max(tol, |f| * tol)
+   @param order maximum number of iteration of the Richardson extrapolation
+   */
+  Eigen::SparseMatrix<double> true_hess_sparse
+    (double const *val, double const eps = 1e-4, double const scale = 2,
+     double const tol = 1e-8, unsigned const order = 6){
+    // setup
+    std::vector<double> val_cp(n_par);
+    std::copy(val, val + n_par, val_cp.begin());
+    std::vector<double> wk_mem;
+
+    // compute the Hessian
+    for(auto &f : funcs){
+      // compute the approximation of the worker's Hessian
+      double *h{f.B};
+      psqn_uint const n_args{f.n_args};
+      psqn_uint const * const indices{f.indices()};
+      for(psqn_uint i = 0; i < n_args; ++i, h += i){
+        auto deriv_functor = [&](double const x, double *gr){
+          psqn_uint const idx{indices[i]};
+          double const old_val{val_cp[idx]};
+          val_cp[idx] = x;
+
+          // unfortunately we have to call this every time
+          caller.setup(val_cp.data(), true);
+          f(val_cp.data(), true, caller);
+
+          std::copy(f.gr, f.gr + i + 1, gr);
+          val_cp[idx] = old_val;
+        };
+
+        using comp_obj = richardson_extrapolation<decltype(deriv_functor)>;
+        unsigned const n_wk_mem{comp_obj::n_wk_mem(n_args, order)};
+        wk_mem.resize(n_wk_mem);
+
+        comp_obj
+          (deriv_functor, order, wk_mem.data(), eps, scale, tol, i + 1)
+          (val_cp[indices[i]], h);
+      }
+    }
+
+    fill_sparse_B_mat();
+    return sparse_B_mat;
+  }
+
 #else
   void get_hess_sparse() {
     throw_no_eigen_error();

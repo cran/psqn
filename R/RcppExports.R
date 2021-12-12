@@ -5,7 +5,8 @@
 #'
 #' @description
 #' Optimization method for specially structured partially separable
-#' functions.
+#' functions. The \code{psqn_aug_Lagrang} function supports non-linear
+#' equality constraints using an augmented Lagrangian method.
 #'
 #' @param par Initial values for the parameters. It is a concatenated
 #' vector of the global parameters and all the private parameters.
@@ -27,8 +28,14 @@
 #' @param max_cg Maximum number of conjugate gradient iterations in each
 #' iteration. Use zero if there should not be a limit.
 #' @param pre_method Preconditioning method in the conjugate gradient method.
-#' Zero yields no preconditioning, one yields diagonal preconditioning, and
-#' two yields the incomplete Cholesky factorization from Eigen.
+#' Zero yields no preconditioning, one yields diagonal preconditioning,
+#' two yields the incomplete Cholesky factorization from Eigen, and
+#' three yields a block diagonal preconditioning. One and three are fast
+#' options with three seeming to work well for some poorly conditioned
+#' problems.
+#' @param mask zero based indices for parameters to mask (i.e. fix).
+#' @param gr_tol convergence tolerance for the Euclidean norm of the gradient. A negative
+#' value yields no check.
 #'
 #' @details
 #' The function follows the method described by Nocedal and Wright (2006)
@@ -58,7 +65,7 @@
 #' gradient iterations.
 #'
 #' @return
-#' An object with the following elements:
+#' \code{pqne}: An object with the following elements:
 #' \item{par}{the estimated global and private parameters.}
 #' \item{value}{function value at \code{par}.}
 #' \item{info}{information code. 0 implies convergence.
@@ -103,7 +110,7 @@
 #'   list(X = X, Z = Z, y = y, u = u, Sigma_inv = solve(Sigma))
 #' }, simplify = FALSE)
 #'
-#' # evalutes the negative log integrand.
+#' # evaluates the negative log integrand.
 #' #
 #' # Args:
 #' #   i cluster/element function index.
@@ -150,9 +157,217 @@
 #' # compare with
 #' beta
 #' c(sapply(sim_dat, "[[", "u"))
+#'
+#' # add equality constraints
+#' idx_constrained <- list(c(2L, 19L), c(1L, 5L, 8L))
+#'
+#' # evaluates the c(x) in equalities c(x) = 0.
+#' #
+#' # Args:
+#' #   i constrain index.
+#' #   par the constrained parameters. It has length zero if we need to pass the
+#' #       one-based indices of the parameters that the i'th constrain depends on.
+#' #   what integer which is zero if the function should be returned and one if the
+#' #        gradient should be computed.
+#' consts <- function(i, par, what){
+#'   if(length(par) == 0)
+#'     # need to return the indices
+#'     return(idx_constrained[[i]])
+#'
+#'   if(i == 1){
+#'     # a linear equality constrain. It is implemented as a non-linear constrain
+#'     # though
+#'     out <- sum(par) - 3
+#'     if(what == 1)
+#'       attr(out, "grad") <- rep(1, length(par))
+#'
+#'   } else if(i == 2){
+#'     # the parameters need to be on a circle
+#'     out <- sum(par^2) - 1
+#'     if(what == 1)
+#'       attr(out, "grad") <- 2 * par
+#'   }
+#'
+#'   out
+#' }
+#'
+#' # optimize with the constraints
+#' res_consts <- psqn_aug_Lagrang(
+#'   par = rep(0, p + q * n_clusters), fn = r_func, consts = consts,
+#'   n_ele_func = n_clusters, n_constraints = length(idx_constrained))
+#'
+#' res_consts
+#' res_consts$multipliers # the estimated multipliers
+#' res_consts$penalty # the penalty parameter
+#'
+#' # the function value is higher (worse) as expected
+#' res$value - res_consts$value
+#'
+#' # the two constraints are satisfied
+#' sum(res_consts$par[idx_constrained[[1]]]) - 3   # ~ 0
+#' sum(res_consts$par[idx_constrained[[2]]]^2) - 1 # ~ 0
+#'
+#' # we can also use another pre conditioner
+#' res_consts_chol <- psqn_aug_Lagrang(
+#'   par = rep(0, p + q * n_clusters), fn = r_func, consts = consts,
+#'   n_ele_func = n_clusters, n_constraints = length(idx_constrained),
+#'   pre_method = 2L)
+#'
+#' res_consts_chol
+#'
 #' @export
-psqn <- function(par, fn, n_ele_func, rel_eps = .00000001, max_it = 100L, n_threads = 1L, c1 = .0001, c2 = .9, use_bfgs = TRUE, trace = 0L, cg_tol = .5, strong_wolfe = TRUE, env = NULL, max_cg = 0L, pre_method = 1L) {
-    .Call(`_psqn_psqn`, par, fn, n_ele_func, rel_eps, max_it, n_threads, c1, c2, use_bfgs, trace, cg_tol, strong_wolfe, env, max_cg, pre_method)
+psqn <- function(par, fn, n_ele_func, rel_eps = .00000001, max_it = 100L, n_threads = 1L, c1 = .0001, c2 = .9, use_bfgs = TRUE, trace = 0L, cg_tol = .5, strong_wolfe = TRUE, env = NULL, max_cg = 0L, pre_method = 1L, mask = as.integer( c()), gr_tol = -1.) {
+    .Call(`_psqn_psqn`, par, fn, n_ele_func, rel_eps, max_it, n_threads, c1, c2, use_bfgs, trace, cg_tol, strong_wolfe, env, max_cg, pre_method, mask, gr_tol)
+}
+
+#' Computes the Hessian.
+#'
+#' @description
+#' Computes the Hessian using numerical differentiation with Richardson
+#' extrapolation.
+#'
+#' @inheritParams psqn
+#' @param fn Function to compute the element functions and their derivatives.
+#' See \code{\link{psqn}} and \code{\link{psqn_generic}}.
+#' @param val Where to evaluate the function at.
+#' @param eps Determines the step size. See the details.
+#' @param scale Scaling factor in the Richardson extrapolation. See the
+#' details.
+#' @param tol Relative convergence criteria. See the details.
+#' @param order Maximum number of iteration of the Richardson extrapolation.
+#'
+#' @details
+#' The function computes the Hessian using numerical differentiation with
+#' centered differences and subsequent use of Richardson
+#' extrapolation to refine the estimate.
+#'
+#' The additional arguments are as follows: The numerical differentiation
+#' is applied for each argument with a step size of
+#' \code{s = max(eps, |x| * eps)}.
+#' The Richardson extrapolation at iteration \code{i} uses a step size of
+#' \code{s * scale^(-i)}. The convergence threshold for each comportment of
+#' the gradient is \code{max(tol, |gr(x)[j]| * tol)}.
+#'
+#' The numerical differentiation is done on each element function and thus
+#' much more efficient then doing it on the whole gradient.
+#'
+#' @examples
+#' # assign model parameters, number of random effects, and fixed effects
+#' q <- 2 # number of private parameters per cluster
+#' p <- 1 # number of global parameters
+#' beta <- sqrt((1:p) / sum(1:p))
+#' Sigma <- diag(q)
+#'
+#' # simulate a data set
+#' set.seed(66608927)
+#' n_clusters <- 20L # number of clusters
+#' sim_dat <- replicate(n_clusters, {
+#'   n_members <- sample.int(8L, 1L) + 2L
+#'   X <- matrix(runif(p * n_members, -sqrt(6 / 2), sqrt(6 / 2)),
+#'               p)
+#'   u <- drop(rnorm(q) %*% chol(Sigma))
+#'   Z <- matrix(runif(q * n_members, -sqrt(6 / 2 / q), sqrt(6 / 2 / q)),
+#'               q)
+#'   eta <- drop(beta %*% X + u %*% Z)
+#'   y <- as.numeric((1 + exp(-eta))^(-1) > runif(n_members))
+#'
+#'   list(X = X, Z = Z, y = y, u = u, Sigma_inv = solve(Sigma))
+#' }, simplify = FALSE)
+#'
+#' # evaluates the negative log integrand.
+#' #
+#' # Args:
+#' #   i cluster/element function index.
+#' #   par the global and private parameter for this cluster. It has length
+#' #       zero if the number of parameters is requested. That is, a 2D integer
+#' #       vector the number of global parameters as the first element and the
+#' #       number of private parameters as the second element.
+#' #   comp_grad logical for whether to compute the gradient.
+#' r_func <- function(i, par, comp_grad){
+#'   dat <- sim_dat[[i]]
+#'   X <- dat$X
+#'   Z <- dat$Z
+#'
+#'   if(length(par) < 1)
+#'     # requested the dimension of the parameter
+#'     return(c(global_dim = NROW(dat$X), private_dim = NROW(dat$Z)))
+#'
+#'   y <- dat$y
+#'   Sigma_inv <- dat$Sigma_inv
+#'
+#'   beta <- par[1:p]
+#'   uhat <- par[1:q + p]
+#'   eta <- drop(beta %*% X + uhat %*% Z)
+#'   exp_eta <- exp(eta)
+#'
+#'   out <- -sum(y * eta) + sum(log(1 + exp_eta)) +
+#'     sum(uhat * (Sigma_inv %*% uhat)) / 2
+#'   if(comp_grad){
+#'     d_eta <- -y + exp_eta / (1 + exp_eta)
+#'     grad <- c(X %*% d_eta,
+#'               Z %*% d_eta + dat$Sigma_inv %*% uhat)
+#'     attr(out, "grad") <- grad
+#'   }
+#'
+#'   out
+#' }
+#'
+#' # compute the hessian
+#' set.seed(1)
+#' par <- runif(p + q * n_clusters, -1)
+#'
+#' hess <- psqn_hess(val = par, fn = r_func, n_ele_func = n_clusters)
+#'
+#' # compare with numerical differentiation from R
+#' if(require(numDeriv)){
+#'     hess_num <- jacobian(function(x){
+#'         out <- numeric(length(x))
+#'         for(i in seq_len(n_clusters)){
+#'             out_i <- r_func(i, x[c(1:p, 1:q + (i - 1L) * q + p)], TRUE)
+#'             out[1:p] <- out[1:p] + attr(out_i, "grad")[1:p]
+#'             out[1:q + (i - 1L) * q + p] <- attr(out_i, "grad")[1:q + p]
+#'         }
+#'         out
+#'     }, par)
+#'
+#'     cat("Output of all.equal\n")
+#'     print(all.equal(Matrix(hess_num, sparse = TRUE), hess))
+#' }
+#'
+#' @export
+psqn_hess <- function(val, fn, n_ele_func, n_threads = 1L, env = NULL, eps = 0.001, scale = 2., tol = 0.000000001, order = 6L) {
+    .Call(`_psqn_psqn_hess`, val, fn, n_ele_func, n_threads, env, eps, scale, tol, order)
+}
+
+#' @rdname psqn
+#'
+#' @param consts Function to compute the constraints which must be equal to
+#' zero. See the example Section.
+#' @param multipliers Staring values for the multipliers in the augmented
+#' Lagrangian method. There needs to be the same number of multipliers as the
+#' number of constraints. An empty vector, \code{numeric()}, yields zero as
+#' the starting value for all multipliers.
+#' @param penalty_start Starting value for the penalty parameterin the
+#' augmented Lagrangian method.
+#' @param max_it_outer Maximum number of augmented Lagrangian steps.
+#' @param violations_norm_thresh Threshold for the norm of the constraint
+#' violations.
+#' @param tau Multiplier used for the penalty parameter between each outer
+#' iterations.
+#' @param n_constraints The number of constraints.
+#'
+#' @return
+#' \code{psqn_aug_Lagrang}: Like \code{psqn} with a few exceptions:
+#' \item{multipliers}{final multipliers from the augmented Lagrangian
+#' method.}
+#' \item{counts}{has an additional element called \code{n_aug_Lagrang} with the
+#' number of augmented Lagrangian iterations.}
+#' \item{penalty}{the final penalty parameter from the augmented Lagrangian
+#' method.}
+#'
+#' @export
+psqn_aug_Lagrang <- function(par, fn, n_ele_func, consts, n_constraints, multipliers = as.numeric( c()), penalty_start = 1L, rel_eps = .00000001, max_it = 100L, max_it_outer = 100L, violations_norm_thresh = 0.000001, n_threads = 1L, c1 = .0001, c2 = .9, tau = 1.5, use_bfgs = TRUE, trace = 0L, cg_tol = .5, strong_wolfe = TRUE, env = NULL, max_cg = 0L, pre_method = 1L, mask = as.integer( c()), gr_tol = -1.) {
+    .Call(`_psqn_psqn_aug_Lagrang`, par, fn, n_ele_func, consts, n_constraints, multipliers, penalty_start, rel_eps, max_it, max_it_outer, violations_norm_thresh, n_threads, c1, c2, tau, use_bfgs, trace, cg_tol, strong_wolfe, env, max_cg, pre_method, mask, gr_tol)
 }
 
 #' BFGS Implementation Used Internally in the psqn Package
@@ -176,6 +391,9 @@ psqn <- function(par, fn, n_ele_func, rel_eps = .00000001, max_it = 100L, n_thre
 #' attribute called \code{"value"}.
 #' @param env Environment to evaluate \code{fn} and \code{gr} in.
 #' \code{NULL} yields the global environment.
+#' @param gr_tol convergence tolerance for the Euclidean norm of the gradient. A negative
+#' value yields no check.
+#'
 #' @export
 #'
 #' @examples
@@ -211,8 +429,15 @@ psqn <- function(par, fn, n_ele_func, rel_eps = .00000001, max_it = 100L, n_thre
 #'                       optim    (c(-1.2, 1), fn, gr, method = "BFGS")))
 #' system.time(replicate(1000,
 #'                       psqn_bfgs(c(-1.2, 1), fn, gr_psqn)))
-psqn_bfgs <- function(par, fn, gr, rel_eps = .00000001, max_it = 100L, c1 = .0001, c2 = .9, trace = 0L, env = NULL) {
-    .Call(`_psqn_psqn_bfgs`, par, fn, gr, rel_eps, max_it, c1, c2, trace, env)
+#'
+#' # we can use an alternative convergence criterion
+#' org <- psqn_bfgs(c(-1.2, 1), fn, gr_psqn, rel_eps = 1e-4)
+#' sqrt(sum(gr_psqn(org$par)^2))
+#'
+#' new_res <- psqn_bfgs(c(-1.2, 1), fn, gr_psqn, rel_eps = 1e-4, gr_tol = 1e-8)
+#' sqrt(sum(gr_psqn(new_res$par)^2))
+psqn_bfgs <- function(par, fn, gr, rel_eps = .00000001, max_it = 100L, c1 = .0001, c2 = .9, trace = 0L, env = NULL, gr_tol = -1.) {
+    .Call(`_psqn_psqn_bfgs`, par, fn, gr, rel_eps, max_it, c1, c2, trace, env, gr_tol)
 }
 
 #' Generic Partially Separable Function Optimization
@@ -239,7 +464,7 @@ psqn_bfgs <- function(par, fn, gr, rel_eps = .00000001, max_it = 100L, c1 = .000
 #' the vignette in the package for examples.
 #'
 #' @return
-#' A list like \code{\link{psqn}}.
+#' A list like \code{\link{psqn}} and \code{\link{psqn_aug_Lagrang}}.
 #'
 #' @references
 #' Nocedal, J. and Wright, S. J. (2006). \emph{Numerical Optimization}
@@ -279,8 +504,8 @@ psqn_bfgs <- function(par, fn, gr, rel_eps = .00000001, max_it = 100L, c1 = .000
 #' # Args:
 #' #   i cluster/element function index.
 #' #   par the parameters that this element function depends on. It has length zero
-#' #       if we need to pass the one-based indices of the parameters that this the
-#' #       i'th element function depends on.
+#' #       if we need to pass the one-based indices of the parameters that the i'th
+#' #       element function depends on.
 #' #   comp_grad TRUE of the gradient should be computed.
 #' r_func <- function(i, par, comp_grad){
 #'   z <- dat[[i]]
@@ -325,13 +550,119 @@ psqn_bfgs <- function(par, fn, gr, rel_eps = .00000001, max_it = 100L, c1 = .000
 #' # we got the same
 #' all.equal(opt$value, R_res$value)
 #'
+#' # also works if we fix some parameters
+#' to_fix <- c(7L, 1L, 18L)
+#' par_fix <- numeric(K)
+#' par_fix[to_fix] <- c(-1, -.5, 0)
+#'
+#' R_res <- psqn_generic(
+#'   par = par_fix, fn = r_func, n_ele_func = length(dat), c1 = 1e-4, c2 = .1,
+#'   trace = 0L, rel_eps = 1e-9, max_it = 1000L, env = environment(),
+#'   mask = to_fix - 1L) # notice the -1L because of the zero based indices
+#'
+#' # the equivalent optim version is
+#' opt <- optim(
+#'   numeric(K - length(to_fix)),
+#'   function(par) { par_fix[-to_fix] <- par; R_func   (par_fix) },
+#'   function(par) { par_fix[-to_fix] <- par; R_func_gr(par_fix)[-to_fix] },
+#'   method = "BFGS", control = list(maxit = 1000L))
+#'
+#' res_optim <- par_fix
+#' res_optim[-to_fix] <- opt$par
+#'
+#' # we got the same
+#' all.equal(res_optim, R_res$par, tolerance = 1e-5)
+#' all.equal(R_res$par[to_fix], par_fix[to_fix]) # the parameters are fixed
+#'
+#' # add equality constraints
+#' idx_constrained <- list(c(2L, 19L, 11L, 7L), c(3L, 5L, 8L), 9:7)
+#'
+#' # evaluates the c(x) in equalities c(x) = 0.
+#' #
+#' # Args:
+#' #   i constrain index.
+#' #   par the constrained parameters. It has length zero if we need to pass the
+#' #       one-based indices of the parameters that the i'th constrain depends on.
+#' #   what integer which is zero if the function should be returned and one if the
+#' #        gradient should be computed.
+#' consts <- function(i, par, what){
+#'   if(length(par) == 0)
+#'     # need to return the indices
+#'     return(idx_constrained[[i]])
+#'
+#'   if(i == 1){
+#'     out <- exp(sum(par[1:2])) + exp(sum(par[3:4])) - 1
+#'     if(what == 1)
+#'       attr(out, "grad") <- c(rep(exp(sum(par[1:2])), 2),
+#'                              rep(exp(sum(par[3:4])), 2))
+#'
+#'   } else if(i == 2){
+#'     # the parameters need to be on a circle
+#'     out <- sum(par^2) - 1
+#'     if(what == 1)
+#'       attr(out, "grad") <- 2 * par
+#'   } else if(i == 3){
+#'     out <- sum(par) - .5
+#'     if(what == 1)
+#'       attr(out, "grad") <- rep(1, length(par))
+#'   }
+#'
+#'   out
+#' }
+#'
+#' # optimize with the constraints and masking
+#' res_consts <- psqn_aug_Lagrang_generic(
+#'   par = par_fix, fn = r_func, n_ele_func = length(dat), c1 = 1e-4, c2 = .1,
+#'   trace = 0L, rel_eps = 1e-8, max_it = 1000L, env = environment(),
+#'   consts = consts, n_constraints = length(idx_constrained),
+#'   mask = to_fix - 1L)
+#'
+#' res_consts
+#'
+#' # the constraints are satisfied
+#' consts(1, res_consts$par[idx_constrained[[1]]], 0) # ~ 0
+#' consts(2, res_consts$par[idx_constrained[[2]]], 0) # ~ 0
+#' consts(3, res_consts$par[idx_constrained[[3]]], 0) # ~ 0
+#'
+#' # compare with the alabama package
+#' if(require(alabama)){
+#'     ala_fit <- auglag(
+#'       par_fix, R_func, R_func_gr,
+#'       heq = function(x){
+#'         c(x[to_fix] - par_fix[to_fix],
+#'           consts(1, x[idx_constrained[[1]]], 0),
+#'           consts(2, x[idx_constrained[[2]]], 0),
+#'           consts(3, x[idx_constrained[[3]]], 0))
+#'       }, control.outer = list(trace = 0L))
+#'
+#'     cat(sprintf("Difference in objective value is %.6f. Parametes are\n",
+#'                 ala_fit$value - res_consts$value))
+#'     print(rbind(alabama = ala_fit$par,
+#'                 psqn = res_consts$par))
+#'
+#'     cat("\nOutput from all.equal\n")
+#'     print(all.equal(ala_fit$par, res_consts$par))
+#' }
+#'
 #' # the overhead here is though quite large with the R interface from the psqn
 #' # package. A C++ implementation is much faster as shown in
 #' # vignette("psqn", package = "psqn"). The reason it is that it is very fast
 #' # to evaluate the element functions in this case
 #'
 #' @export
-psqn_generic <- function(par, fn, n_ele_func, rel_eps = .00000001, max_it = 100L, n_threads = 1L, c1 = .0001, c2 = .9, use_bfgs = TRUE, trace = 0L, cg_tol = .5, strong_wolfe = TRUE, env = NULL, max_cg = 0L, pre_method = 1L) {
-    .Call(`_psqn_psqn_generic`, par, fn, n_ele_func, rel_eps, max_it, n_threads, c1, c2, use_bfgs, trace, cg_tol, strong_wolfe, env, max_cg, pre_method)
+psqn_generic <- function(par, fn, n_ele_func, rel_eps = .00000001, max_it = 100L, n_threads = 1L, c1 = .0001, c2 = .9, use_bfgs = TRUE, trace = 0L, cg_tol = .5, strong_wolfe = TRUE, env = NULL, max_cg = 0L, pre_method = 1L, mask = as.integer( c()), gr_tol = -1.) {
+    .Call(`_psqn_psqn_generic`, par, fn, n_ele_func, rel_eps, max_it, n_threads, c1, c2, use_bfgs, trace, cg_tol, strong_wolfe, env, max_cg, pre_method, mask, gr_tol)
+}
+
+#' @rdname psqn_generic
+#' @export
+psqn_aug_Lagrang_generic <- function(par, fn, n_ele_func, consts, n_constraints, multipliers = as.numeric( c()), penalty_start = 1L, rel_eps = .00000001, max_it = 100L, max_it_outer = 100L, violations_norm_thresh = 0.000001, n_threads = 1L, c1 = .0001, c2 = .9, tau = 1.5, use_bfgs = TRUE, trace = 0L, cg_tol = .5, strong_wolfe = TRUE, env = NULL, max_cg = 0L, pre_method = 1L, mask = as.integer( c()), gr_tol = -1.) {
+    .Call(`_psqn_psqn_aug_Lagrang_generic`, par, fn, n_ele_func, consts, n_constraints, multipliers, penalty_start, rel_eps, max_it, max_it_outer, violations_norm_thresh, n_threads, c1, c2, tau, use_bfgs, trace, cg_tol, strong_wolfe, env, max_cg, pre_method, mask, gr_tol)
+}
+
+#' @rdname psqn_hess
+#' @export
+psqn_generic_hess <- function(val, fn, n_ele_func, n_threads = 1L, env = NULL, eps = 0.001, scale = 2., tol = 0.000000001, order = 6L) {
+    .Call(`_psqn_psqn_generic_hess`, val, fn, n_ele_func, n_threads, env, eps, scale, tol, order)
 }
 
