@@ -1,7 +1,7 @@
 Package: psqn
 Type: Package
 Title: Partially Separable Quasi-Newton
-Version: 0.3.0
+Version: 0.3.1
 Authors@R: c(person("Benjamin", "Christoffersen", 
                     email = "boennecd@gmail.com", 
                     role = c("cre", "aut"), 
@@ -23,8 +23,8 @@ Suggests: R.rsp, rmarkdown, RcppArmadillo, RcppEigen, bench, testthat,
 VignetteBuilder: R.rsp
 SystemRequirements: C++11
 NeedsCompilation: yes
-Packaged: 2021-12-12 17:21:31 UTC; boennecd
+Packaged: 2022-03-02 13:10:38 UTC; boennecd
 Author: Benjamin Christoffersen [cre, aut]
     (<https://orcid.org/0000-0002-7182-1346>)
 Repository: CRAN
-Date/Publication: 2021-12-12 17:50:02 UTC
+Date/Publication: 2022-03-02 14:20:10 UTC
